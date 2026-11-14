@@ -1,0 +1,9 @@
+{
+  "identity_key": "QCFBNfqMos1kbcky3J6JCQp7nf3GDZiWkH6SxfF1rjg=",
+  "identity_x25519_key": "2j70UJ0BcvJcZooixbqM4FT6khzQzdJsTcZK5PG1d3I=",
+  "signed_prekey": "a2mJO5dRiAIyuaklS4BAbLWyPpEHR8TmanWswHPqkDY=",
+  "prekey_signature": "q0eyXK5AzEF7fisUM3/oaNU8ZSIA8EgBVvBtQx2/vqFSRt5IUIQ3oYt9ACKDc0/M7hjxUFXJxo1IMbh5L0dZBg==",
+  "one_time_prekey": null,
+  "identity_key_version": 1,
+  "rotation_signature": null
+}

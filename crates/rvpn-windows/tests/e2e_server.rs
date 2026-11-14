@@ -182,30 +182,44 @@ fn full_tunnel_roundtrip() {
 
     // Expect the answer to come back down the tunnel. Poll directly —
     // wait_for_packet's notify can race with a drained receiver.
+    //
+    // NOTE: `recv_packet_from_server` yields *batches* of
+    // [u16-LE length][raw IP packet] entries (the same format the Swift
+    // host consumes) — one received item can contain several packets.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        while let Some(response) = client.recv_packet_from_server() {
-            if response.len() < 28 || response[9] != 17 {
-                continue; // not IPv4/UDP (e.g. some control frame)
+        while let Some(batch) = client.recv_packet_from_server() {
+            let mut off = 0usize;
+            while off + 2 <= batch.len() {
+                let plen = u16::from_le_bytes([batch[off], batch[off + 1]]) as usize;
+                off += 2;
+                if off + plen > batch.len() {
+                    break;
+                }
+                let response = &batch[off..off + plen];
+                off += plen;
+
+                if response.len() < 28 || response[9] != 17 {
+                    continue; // not IPv4/UDP
+                }
+                let sport = u16::from_be_bytes([response[20], response[21]]);
+                if sport != 53 {
+                    continue;
+                }
+                // A DNS answer has QR=1 and at least one answer.
+                let dns = &response[28..];
+                assert!(dns.len() >= 12, "DNS header present");
+                let flags = u16::from_be_bytes([dns[2], dns[3]]);
+                let answers = u16::from_be_bytes([dns[6], dns[7]]);
+                println!(
+                    "DNS reply: flags={flags:#06x} answers={answers} packet_bytes={}",
+                    response.len()
+                );
+                assert_eq!(flags & 0x8000, 0x8000, "QR bit set (it is a response)");
+                println!("E2E PASS: query relayed through the server and answered");
+                client.stop();
+                return;
             }
-            let sport = u16::from_be_bytes([response[20], response[21]]);
-            if sport != 53 {
-                continue;
-            }
-            // A DNS answer has QR=1 and at least one answer (or the
-            // rcode set). Parse enough to prove it is a real reply.
-            let dns = &response[28..];
-            assert!(dns.len() >= 12, "DNS header present");
-            let flags = u16::from_be_bytes([dns[2], dns[3]]);
-            let answers = u16::from_be_bytes([dns[6], dns[7]]);
-            println!(
-                "DNS reply: flags={flags:#06x} answers={answers} bytes={}",
-                response.len()
-            );
-            assert_eq!(flags & 0x8000, 0x8000, "QR bit set (it is a response)");
-            println!("E2E PASS: query relayed through the server and answered");
-            client.stop();
-            return;
         }
         if Instant::now() > deadline {
             break;

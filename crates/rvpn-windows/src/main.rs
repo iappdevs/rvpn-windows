@@ -1,45 +1,26 @@
-//! rvpn-windows — the R-VPN client for Windows.
-//!
-//! Process layout (single process, single binary):
-//! * `main` thread — eframe/egui UI + tray icon
-//! * `rvpn-connect` — connect sequence (blocking) when requested
-//! * `rvpn-stop` — teardown sequence
-//! * `rvpn-engine` ×2 — tokio workers driving the rVPN engine
-//! * `rvpn-pump-up` / `rvpn-pump-down` — Wintun ring ⇄ engine packet pumps
-//!
-//! The engine itself is the same production stack the macOS/iOS apps ship
-//! (`rvpn-mobile`'s `IosTunClient`), used in-process — no FFI boundary.
+//! rvpn-windows — the R-VPN client for Windows. See `lib.rs` for the
+//! library surface; this binary only wires up logging, the tray, and the
+//! egui window.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
-mod app;
-mod engine;
-mod identity;
-mod logging;
-mod paths;
-mod platform;
-mod profile;
-mod tray;
-mod tundevice;
-mod winroute;
 
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     // Single instance — a second launch just exits (the first is in the tray).
-    let _instance = platform::SingleInstance::try_acquire();
+    let _instance = rvpn_windows::platform::SingleInstance::try_acquire();
 
-    paths::ensure_dirs().expect("failed to create %APPDATA% directories");
+    rvpn_windows::paths::ensure_dirs().expect("failed to create %APPDATA% directories");
 
     // Logging: GUI ring + capped file. Set RVPN_LOG_LEVEL=debug|trace for
     // engine diagnostics (same variable the upstream apps honour).
-    let ring = logging::LogRing::default();
-    logging::init(&ring, Some(paths::log_dir().join("rvpn-windows.log")));
+    let ring = rvpn_windows::logging::LogRing::default();
+    rvpn_windows::logging::init(&ring, Some(rvpn_windows::paths::log_dir().join("rvpn-windows.log")));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "rvpn-windows starting");
 
     // The tray must be created before the GUI loop so its Win32 message
     // window exists; on failure we still run as a plain window app.
-    let tray = tray::Tray::new(&engine::EnginePhase::Idle).ok();
+    let tray = rvpn_windows::tray::Tray::new(&rvpn_windows::engine::EnginePhase::Idle).ok();
 
     let icon = window_icon();
     let options = eframe::NativeOptions {
@@ -51,10 +32,10 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    let mut app = app::RvpnApp::new(ring, tray);
+    let mut app = rvpn_windows::app::RvpnApp::new(ring, tray);
 
     // Auto-connect the default profile if requested.
-    let settings = profile::AppSettings::load_from_disk();
+    let settings = rvpn_windows::profile::AppSettings::load_from_disk();
     if settings.auto_connect {
         if let Some(default) = app.default_profile_slug() {
             app.select_profile(&default);
@@ -93,7 +74,7 @@ fn style(cc: &eframe::CreationContext<'_>) {
 
 fn window_icon() -> egui::IconData {
     // Same procedural shield as the tray icon, in the connected-green accent.
-    let (rgba, w, h) = tray::icon_rgba([46, 184, 114]);
+    let (rgba, w, h) = rvpn_windows::tray::icon_rgba([46, 184, 114]);
     egui::IconData {
         rgba,
         width: w,

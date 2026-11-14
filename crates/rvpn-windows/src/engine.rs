@@ -399,7 +399,9 @@ impl EngineHandle {
             .expect("failed to spawn uplink pump");
 
         // Downlink: engine → OS ring. `wait_for_packet` parks on a condvar;
-        // drain everything that arrived behind it.
+        // drain everything that arrived behind it. Each received item is a
+        // BATCH of packets in [u16-LE length][raw IP packet] form (the same
+        // format the Swift host consumes) — unbatch before writing to TUN.
         let stop = self.inner.stop_flag.clone();
         let rx_bytes = self.inner.rx_bytes.clone();
         let client_down = client.clone();
@@ -409,11 +411,13 @@ impl EngineHandle {
             .spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     if client_down.wait_for_packet(200) == 1 {
-                        while let Some(packet) = client_down.recv_packet_from_server() {
-                            rx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
-                            if let Err(e) = dev_down.send(&packet) {
-                                tracing::debug!(error = %e, "downlink write failed");
-                            }
+                        while let Some(batch) = client_down.recv_packet_from_server() {
+                            for_each_packet(&batch, |packet| {
+                                rx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                                if let Err(e) = dev_down.send(packet) {
+                                    tracing::debug!(error = %e, "downlink write failed");
+                                }
+                            });
                         }
                     }
                 }
@@ -534,6 +538,22 @@ fn join_pumps(inner: &EngineInner) {
     }
 }
 
+/// Iterate the `[u16-LE length][raw IP packet]` entries of a downlink batch.
+/// Malformed tails are skipped defensively (never panic in the pump thread).
+pub(crate) fn for_each_packet(batch: &[u8], mut f: impl FnMut(&[u8])) {
+    let mut off = 0usize;
+    while off + 2 <= batch.len() {
+        let plen = u16::from_le_bytes([batch[off], batch[off + 1]]) as usize;
+        off += 2;
+        if off + plen > batch.len() {
+            tracing::warn!("downlink batch truncated at {off} (need {plen})");
+            return;
+        }
+        f(&batch[off..off + plen]);
+        off += plen;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +569,30 @@ mod tests {
             panic!("wrong variant");
         };
         assert_eq!(ip, "10.0.0.2");
+    }
+
+    #[test]
+    fn batch_iteration_yields_all_packets() {
+        // [len=2][de] [len=3][abc]
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&2u16.to_le_bytes());
+        batch.extend_from_slice(b"de");
+        batch.extend_from_slice(&3u16.to_le_bytes());
+        batch.extend_from_slice(b"abc");
+
+        let mut out = Vec::new();
+        for_each_packet(&batch, |p| out.push(p.to_vec()));
+        assert_eq!(out, vec![b"de".to_vec(), b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn batch_iteration_skips_truncated_tail() {
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&2u16.to_le_bytes());
+        batch.extend_from_slice(b"de");
+        batch.extend_from_slice(&10u16.to_le_bytes()); // claims 10, nothing left
+        let mut out = Vec::new();
+        for_each_packet(&batch, |p| out.push(p.to_vec()));
+        assert_eq!(out, vec![b"de".to_vec()]);
     }
 }
