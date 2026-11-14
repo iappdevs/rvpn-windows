@@ -1,0 +1,173 @@
+From c0ee774350014602c5341a17573496efddfdb5db Mon Sep 17 00:00:00 2001
+From: Amir <gilaniamirhossein@gmail.com>
+Date: Sat, 14 Nov 2026 18:26:21 +0330
+Subject: [PATCH 6/6] socks5_server: reply exactly once, in the client's
+ dialect
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The SOCKS4 branch replied inside the handshake AND the shared path sent
+the SOCKS5-format response afterwards — the duplicated/mismatched bytes
+sat in front of the payload and clients saw 'HTTP/0.9' (lead byte was
+not 'H'), so every page failed to load. Replies now go through one
+dialect-aware reply_connect() emitted once, after the split-tunnel
+decision.
+---
+ rvpn/crates/rvpn-mobile/src/socks5_server.rs | 60 +++++++++++++-------
+ 1 file changed, 38 insertions(+), 22 deletions(-)
+
+diff --git a/rvpn/crates/rvpn-mobile/src/socks5_server.rs b/rvpn/crates/rvpn-mobile/src/socks5_server.rs
+index f894aa4..42e1ebd 100644
+--- a/rvpn/crates/rvpn-mobile/src/socks5_server.rs
++++ b/rvpn/crates/rvpn-mobile/src/socks5_server.rs
+@@ -505,13 +505,13 @@ async fn handle_socks5_connection(
+ ) -> Result<()> {
+     info!("[SOCKS5] New connection from {}", addr);
+ 
+-    // 1. SOCKS5 handshake - get target address
+-    let (mut target_addr, target_host) = match socks5_handshake(&mut socket, udp_tunnel_sender, split_tunnel.clone(), dns_config.clone()).await {
+-        Ok(Some(addr)) => {
+-            info!("[SOCKS5] Handshake successful, target: {}", addr);
++    // 1. SOCKS5 handshake - get target address (and which dialect replied)
++    let (mut target_addr, target_host, is_socks4) = match socks5_handshake(&mut socket, udp_tunnel_sender, split_tunnel.clone(), dns_config.clone()).await {
++        Ok(Some((addr, is_socks4))) => {
++            info!("[SOCKS5] Handshake successful (SOCKS{}), target: {}", if is_socks4 { 4 } else { 5 }, addr);
+             // Extract host from target for DNS routing
+             let host = addr.split(':').next().unwrap_or("").to_string();
+-            (addr, host)
++            (addr, host, is_socks4)
+         }
+         Ok(None) => {
+             // UDP ASSOCIATE - already handled, no TCP relay needed
+@@ -545,12 +545,12 @@ async fn handle_socks5_connection(
+                         if direct_bypass {
+                             // Self-contained hosts (Windows/desktop): relay the
+                             // flow ourselves over the normal internet.
+-                            send_socks5_success(&mut socket).await?;
++                            reply_connect(&mut socket, is_socks4, true).await?;
+                             return direct_relay(&mut socket, &target_addr).await;
+                         }
+                         // Send SOCKS5 error: Connection not allowed by ruleset (0x02)
+                         // This signals to iOS that it should retry with direct connection
+-                        send_socks5_error(&mut socket, 0x02).await?;
++                        reply_connect(&mut socket, is_socks4, false).await?;
+                         return Ok(());
+                     }
+                     RoutingDecision::Block => {
+@@ -558,7 +558,7 @@ async fn handle_socks5_connection(
+                             "[SOCKS5] Connection to {}:{} blocked", 
+                             target_host, target_port
+                         );
+-                        send_socks5_error(&mut socket, 0x02).await?;
++                        reply_connect(&mut socket, is_socks4, false).await?;
+                         return Ok(());
+                     }
+                     RoutingDecision::Tunnel => {
+@@ -586,12 +586,12 @@ async fn handle_socks5_connection(
+                             "[SOCKS5] Connection to {}:{} bypassing VPN (domain rule)",
+                             target_host, target_port
+                         );
+-                        send_socks5_success(&mut socket).await?;
++                        reply_connect(&mut socket, is_socks4, true).await?;
+                         return direct_relay(&mut socket, &target_addr).await;
+                     }
+                     RoutingDecision::Block => {
+                         warn!("[SOCKS5] Connection to {}:{} blocked (domain rule)", target_host, target_port);
+-                        send_socks5_error(&mut socket, 0x02).await?;
++                        reply_connect(&mut socket, is_socks4, false).await?;
+                         return Ok(());
+                     }
+                     RoutingDecision::Tunnel => {}
+@@ -620,7 +620,7 @@ async fn handle_socks5_connection(
+                                 // Self-contained hosts: query the local resolver
+                                 // ourselves over the normal internet.
+                                 let dns_addr = format!("{}:53", local_dns);
+-                                send_socks5_success(&mut socket).await?;
++                                reply_connect(&mut socket, is_socks4, true).await?;
+                                 return direct_relay(&mut socket, &dns_addr).await;
+                             }
+                             target_addr = format!("{}:53", local_dns);
+@@ -641,7 +641,7 @@ async fn handle_socks5_connection(
+                     RoutingDecision::Block => {
+                         info!("DNS for {} blocked", domain_to_check);
+                         // Return connection refused
+-                        send_socks5_refused(&mut socket).await?;
++                        reply_connect(&mut socket, is_socks4, false).await?;
+                         return Ok(());
+                     }
+                 }
+@@ -651,7 +651,7 @@ async fn handle_socks5_connection(
+ 
+     // 3. Send success response to SOCKS5 client
+     // Note: We send this BEFORE tunnel is ready because SOCKS5 protocol requires it
+-    send_socks5_success(&mut socket).await?;
++    reply_connect(&mut socket, is_socks4, true).await?;
+     debug!("Sent SOCKS5 success response to {}", addr);
+ 
+     // 4. Create completion channel
+@@ -714,7 +714,7 @@ async fn socks5_handshake(
+     udp_tunnel_sender: mpsc::Sender<UdpAssociationRequest>,
+     split_tunnel: Option<Arc<SplitTunnel>>,
+     dns_config: DnsConfig,
+-) -> Result<Option<String>> {
++) -> Result<Option<(String, bool)>> {
+     // Read client greeting: [VER][NMETHODS]
+     let mut greeting = [0u8; 2];
+     socket.read_exact(&mut greeting).await
+@@ -772,16 +772,15 @@ async fn socks5_handshake(
+             Ipv4Addr::from(dst_ip).to_string()
+         };
+ 
+-        // Send success reply: [0x00][0x5A][DSTPORT BE][DSTIP] (0.0.0.0 for 4a domains)
+-        let reply_ip: [u8; 4] = if is_socks4a { [0, 0, 0, 0] } else { dst_ip };
+-        socket.write_all(&[0x00, 0x5A, rest[0], rest[1], reply_ip[0], reply_ip[1], reply_ip[2], reply_ip[3]]).await
+-            .map_err(|e| anyhow::anyhow!("SOCKS4: failed to send reply: {}", e))?;
+-        socket.flush().await
+-            .map_err(|e| anyhow::anyhow!("SOCKS4: failed to flush reply: {}", e))?;
++        // The CONNECT reply is NOT sent here — the caller sends it via
++        // `reply_connect` after the split-tunnel decision, exactly once,
++        // in the dialect the client speaks. Replying here as well led to a
++        // duplicated 8-byte header that corrupted the payload stream
++        // (clients saw "HTTP/0.9" — a lead byte that was not "H").
+ 
+         info!("[SOCKS5] SOCKS4/4a CONNECT {}:{}", host, port);
+ 
+-        return Ok(Some(format!("{}:{}", host, port)));
++        return Ok(Some((format!("{}:{}", host, port), true)));
+     }
+ 
+     if greeting[0] != 0x05 {
+@@ -880,7 +879,7 @@ async fn socks5_handshake(
+         }
+     };
+     
+-    Ok(Some(target))
++    Ok(Some((target, false)))
+ }
+ 
+ /// Handle UDP ASSOCIATE command
+@@ -1729,3 +1728,20 @@ async fn direct_relay(socket: &mut TcpStream, target_addr: &str) -> Result<()> {
+     tokio::io::copy_bidirectional(socket, &mut outbound).await?;
+     Ok(())
+ }
++
++/// Dialect-aware CONNECT reply: SOCKS4 clients expect the 8-byte
++/// [0x00][0x5A granted / 0x5B rejected] reply and SOCKS5 clients the
++/// 10-byte response — after a SOCKS4 greeting a SOCKS5-format byte would
++/// corrupt the stream the client reads the payload from.
++async fn reply_connect(socket: &mut TcpStream, socks4: bool, granted: bool) -> Result<()> {
++    if socks4 {
++        let code = if granted { 0x5A } else { 0x5B };
++        socket.write_all(&[0x00, code, 0, 0, 0, 0, 0, 0]).await?;
++        socket.flush().await?;
++    } else if granted {
++        send_socks5_success(socket).await?;
++    } else {
++        send_socks5_error(socket, 0x02).await?;
++    }
++    Ok(())
++}
+-- 
+2.51.0.windows.1
+

@@ -1,7 +1,7 @@
 From 290c0cd93cba1efcccbab585816786185539aad2 Mon Sep 17 00:00:00 2001
 From: Amir <gilaniamirhossein@gmail.com>
 Date: Sat, 14 Nov 2026 17:08:48 +0330
-Subject: [PATCH 4/5] proxy mode: real direct-bypass in SOCKS5 frontend +
+Subject: [PATCH 4/6] proxy mode: real direct-bypass in SOCKS5 frontend +
  working per-flow relay
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

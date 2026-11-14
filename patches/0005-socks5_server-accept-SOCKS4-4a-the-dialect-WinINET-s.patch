@@ -1,7 +1,7 @@
 From 0d96729b562ba3d4236408c653422e651ee71d91 Mon Sep 17 00:00:00 2001
 From: Amir <gilaniamirhossein@gmail.com>
 Date: Sat, 14 Nov 2026 18:05:26 +0330
-Subject: [PATCH 5/5] socks5_server: accept SOCKS4/4a (the dialect WinINET
+Subject: [PATCH 5/6] socks5_server: accept SOCKS4/4a (the dialect WinINET
  speaks)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

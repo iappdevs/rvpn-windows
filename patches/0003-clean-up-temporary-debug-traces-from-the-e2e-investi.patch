@@ -1,7 +1,7 @@
 From 539f7fd8fd28bf3e751180ad328e5f98bb557001 Mon Sep 17 00:00:00 2001
 From: Amir <gilaniamirhossein@gmail.com>
 Date: Sat, 14 Nov 2026 15:13:30 +0330
-Subject: [PATCH 3/5] clean up temporary debug traces from the e2e
+Subject: [PATCH 3/6] clean up temporary debug traces from the e2e
  investigation
 
 ---
