@@ -420,16 +420,8 @@ impl eframe::App for RvpnApp {
                 });
             });
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(18, 21, 26)))
-            .show(ctx, |ui| match self.view {
-                View::Connect => self.view_connect(ui),
-                View::Profiles => self.view_profiles(ui),
-                View::Settings => self.view_settings(ui),
-                View::Logs => self.view_logs(ui),
-            });
-
-        // Bottom flash bar.
+        // Bottom flash bar — drawn before the central panel so egui reserves
+        // its space correctly.
         if let Some((msg, at, color)) = &self.flash {
             if at.elapsed().as_secs() < 6 {
                 egui::TopBottomPanel::bottom("flash").show(ctx, |ui| {
@@ -441,6 +433,15 @@ impl eframe::App for RvpnApp {
                 self.flash = None;
             }
         }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(18, 21, 26)))
+            .show(ctx, |ui| match self.view {
+                View::Connect => self.view_connect(ui),
+                View::Profiles => self.view_profiles(ui),
+                View::Settings => self.view_settings(ui),
+                View::Logs => self.view_logs(ui),
+            });
 
         self.show_tofu_dialog(ctx);
         self.show_profile_editor(ctx);
@@ -919,34 +920,25 @@ impl RvpnApp {
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Save").clicked() {
-                    match editing.validate() {
-                        Ok(()) | Err(_) => {
-                            // allow saving incomplete drafts; validation happens on connect
-                            editing.slug = crate::profile::slugify(&editing.name);
-                            if let Some(existing) =
-                                self.profiles.iter_mut().find(|p| p.slug == editing.slug)
-                            {
-                                // keep identity/prekey files when renaming over same slug
-                                *existing = editing.clone();
-                            } else {
-                                let _ = std::fs::create_dir_all(editing.dir());
-                                if editing.is_default {
-                                    for p in self.profiles.iter_mut() {
-                                        p.is_default = false;
-                                    }
-                                }
-                                self.profiles.push(editing.clone());
-                            }
-                            if editing.is_default {
-                                for p in self.profiles.iter_mut() {
-                                    p.is_default = p.slug == editing.slug;
-                                }
-                            }
-                            let _ = ProfileStore::save(&self.profiles);
-                            self.selected_profile = Some(editing.slug);
-                            self.editing = None;
+                    // Incomplete drafts are allowed — full validation happens
+                    // at connect time (`Profile::validate`).
+                    editing.slug = crate::profile::slugify(&editing.name);
+                    if let Some(existing) =
+                        self.profiles.iter_mut().find(|p| p.slug == editing.slug)
+                    {
+                        *existing = editing.clone();
+                    } else {
+                        let _ = std::fs::create_dir_all(editing.dir());
+                        self.profiles.push(editing.clone());
+                    }
+                    if editing.is_default {
+                        for p in self.profiles.iter_mut() {
+                            p.is_default = p.slug == editing.slug;
                         }
                     }
+                    let _ = ProfileStore::save(&self.profiles);
+                    self.selected_profile = Some(editing.slug);
+                    self.editing = None;
                 }
                 if ui.button("Cancel").clicked() {
                     self.editing = None;
