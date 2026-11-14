@@ -504,11 +504,17 @@ impl RvpnApp {
         });
         ui.add_space(12.0);
 
-        // Profile selector.
+        // Profile selector — the label carries the profile's current mode.
         egui::ComboBox::from_id_salt("profile")
             .selected_text(
                 self.selected()
-                    .map(|p| p.name.clone())
+                    .map(|p| {
+                        let mode = match p.mode {
+                            ConnMode::Tun => "TUN".to_string(),
+                            ConnMode::Proxy => format!("SOCKS5:{}", p.proxy_port),
+                        };
+                        format!("{}  ·  {}", p.name, mode)
+                    })
                     .unwrap_or_else(|| "no profile".into()),
             )
             .width(ui.available_width() - 220.0)
@@ -521,7 +527,79 @@ impl RvpnApp {
                     );
                 }
             });
-        ui.add_space(16.0);
+        ui.add_space(8.0);
+
+        // Quick settings for the selected profile: mode + proxy port, saved
+        // straight into the profile (no editor round-trip). Applies on the
+        // next connect while a session is running.
+        if let Some(selected) = self.selected().cloned() {
+            let mut updated = selected.clone();
+            let running = self.engine.as_ref().is_some_and(|e| e.is_active());
+            egui::Frame::NONE
+                .fill(CARD_BG)
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Mode")
+                                .small()
+                                .color(Color32::from_gray(120)),
+                        );
+                        let tun = updated.mode == ConnMode::Tun;
+                        if ui
+                            .selectable_label(tun, RichText::new("Full tunnel (TUN)").small())
+                            .clicked()
+                        {
+                            updated.mode = ConnMode::Tun;
+                        }
+                        if ui
+                            .selectable_label(!tun, RichText::new("SOCKS5 proxy").small())
+                            .clicked()
+                        {
+                            updated.mode = ConnMode::Proxy;
+                        }
+                        if updated.mode == ConnMode::Proxy {
+                            ui.separator();
+                            ui.label(
+                                RichText::new("Port")
+                                    .small()
+                                    .color(Color32::from_gray(120)),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut updated.proxy_port)
+                                    .range(1024..=65535),
+                            );
+                            ui.label(
+                                RichText::new(format!("socks5://127.0.0.1:{}", updated.proxy_port))
+                                    .small()
+                                    .monospace()
+                                    .color(Color32::from_gray(140)),
+                            );
+                        }
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if running {
+                                ui.label(
+                                    RichText::new("applies on next connect")
+                                        .small()
+                                        .color(WARN),
+                                );
+                            }
+                        });
+                    });
+                });
+            if updated != selected {
+                if let Some(p) = self
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.slug == selected.slug)
+                {
+                    *p = updated;
+                }
+                let _ = ProfileStore::save(&self.profiles);
+            }
+        }
+        ui.add_space(12.0);
 
         // Status card.
         egui::Frame::NONE

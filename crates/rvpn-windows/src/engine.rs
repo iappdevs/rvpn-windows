@@ -309,7 +309,7 @@ impl EngineHandle {
             resumption: None,
         };
 
-        let stop = self.inner.stop_flag.clone();
+        let _stop = self.inner.stop_flag.clone();
         let rx_bytes = self.inner.rx_bytes.clone();
         let tx_bytes = self.inner.tx_bytes.clone();
         let mut flow_task = {
