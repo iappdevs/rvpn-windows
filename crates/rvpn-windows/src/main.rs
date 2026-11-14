@@ -7,8 +7,12 @@
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
-    // Single instance — a second launch just exits (the first is in the tray).
-    let _instance = rvpn_windows::platform::SingleInstance::try_acquire();
+    // Single instance: if another copy is already running (usually parked in
+    // the tray), surface its window instead of starting a second one.
+    let Some(_instance) = rvpn_windows::platform::SingleInstance::try_acquire() else {
+        rvpn_windows::platform::activate_running_instance();
+        return Ok(());
+    };
 
     rvpn_windows::paths::ensure_dirs().expect("failed to create %APPDATA% directories");
 

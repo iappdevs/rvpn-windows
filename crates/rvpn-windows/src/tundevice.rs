@@ -100,10 +100,10 @@ impl TunDevice {
         Ok(())
     }
 
-    /// Point the adapter's resolver at the loopback DoH proxy.
-    pub fn configure_dns(&self, resolver: std::net::IpAddr) -> Result<()> {
+    /// Point the adapter's resolver at the given servers (primary order kept).
+    pub fn configure_dns(&self, resolvers: &[std::net::IpAddr]) -> Result<()> {
         self.adapter
-            .set_dns_servers(&[resolver])
+            .set_dns_servers(resolvers)
             .context("failed to set the tunnel DNS resolver")
     }
 

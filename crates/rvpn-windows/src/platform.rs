@@ -62,6 +62,24 @@ impl Drop for SingleInstance {
     }
 }
 
+/// Bring the already-running instance's window to the foreground.
+pub fn activate_running_instance() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, SW_RESTORE, ShowWindow,
+    };
+
+    // The egui viewport is titled "R-VPN" (updated with state as
+    // "R-VPN — Connected" etc.), so match by the "R-VPN" prefix.
+    let title: Vec<u16> = "R-VPN\0".encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_VALUE: &str = "rvpn-windows";
 

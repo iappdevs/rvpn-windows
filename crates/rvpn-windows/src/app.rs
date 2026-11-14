@@ -214,6 +214,9 @@ impl RvpnApp {
                 EngineEvent::Readdressed { ip, gateway } => {
                     self.flash(format!("Tunnel address updated: {ip} via {gateway}"), ACCENT);
                 }
+                EngineEvent::Notice(msg) => {
+                    self.flash(msg, WARN);
+                }
                 EngineEvent::Stopped => {
                     self.snapshot = EngineSnapshot {
                         phase: EnginePhase::Idle,

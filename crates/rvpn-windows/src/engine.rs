@@ -44,6 +44,8 @@ pub enum EngineEvent {
     TofuMismatch { slug: String, expected: String, actual: String },
     /// Server-assigned address changed after a reconnect; routes updated.
     Readdressed { ip: String, gateway: String },
+    /// Informational notice for the UI (non-fatal).
+    Notice(String),
     /// Engine fully stopped (teardown finished).
     Stopped,
 }
@@ -341,10 +343,45 @@ impl EngineHandle {
         }
         winroute::install_routes(winroute::ADAPTER_NAME, gateway, &original_route, &bypass_cidrs)
             .context("failed to install tunnel routes")?;
-        device
-            .configure_dns(std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST))
-            .context("failed to set the tunnel DNS resolver")?;
-        let routes = winroute::add_nrpt_rule();
+
+        // DNS strategy: the loopback DoH proxy needs UDP 127.0.0.1:53. Local
+        // DNS tools (e.g. Shecan/nextdns) often hold that port — routing the
+        // system resolver at 127.0.0.1 then leaks queries to that tool
+        // instead of the tunnel, which breaks name resolution mid-session.
+        // Detect it and fall back to the profile's resolvers (carried inside
+        // the tunnel by the 0/1+128/1 routes) instead.
+        let local_dns_port_free = std::net::UdpSocket::bind("127.0.0.1:53").is_ok();
+        let routes;
+        if local_dns_port_free {
+            device
+                .configure_dns(&[std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)])
+                .context("failed to set the tunnel DNS resolver")?;
+            routes = winroute::add_nrpt_rule();
+        } else {
+            let fallback: Vec<std::net::IpAddr> = profile
+                .dns_servers
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let fallback = if fallback.is_empty() {
+                vec![std::net::IpAddr::from(std::net::Ipv4Addr::new(1, 1, 1, 1))]
+            } else {
+                fallback
+            };
+            tracing::warn!(
+                servers = ?fallback,
+                "127.0.0.1:53 is taken by another DNS tool — using the profile resolvers via the tunnel"
+            );
+            device
+                .configure_dns(&fallback)
+                .context("failed to set the tunnel DNS resolver")?;
+            routes = winroute::RouteState::default(); // no NRPT: 127.0.0.1 would point at the other tool
+            send_event(EngineEvent::Notice(
+                "Local DNS port 53 is used by another tool (e.g. Shecan) — \
+                 resolving via 1.1.1.1 through the tunnel."
+                    .into(),
+            ));
+        }
 
         // ---- 8. Pumps ----------------------------------------------------------------
         self.spawn_pumps(&client, &device);

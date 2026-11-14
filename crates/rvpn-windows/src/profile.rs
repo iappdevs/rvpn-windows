@@ -251,6 +251,10 @@ impl ProfileStore {
     }
 
     /// Import a `.rvpn` document; returns the stored profile.
+    ///
+    /// When the export carries no identity key (the default — keys are
+    /// per-device), a fresh identity is generated automatically so the
+    /// recipient only has to press Connect.
     pub fn import(doc: &str, existing: &[Profile]) -> Result<Profile> {
         let export: ProfileExport =
             serde_json::from_str(doc).context("Not a valid .rvpn profile file")?;
@@ -263,18 +267,28 @@ impl ProfileStore {
         serde_json::from_str::<rvpn_core::crypto::X3DHPublicBundle>(&export.prekey_bundle)
             .context("Prekey bundle inside the profile is invalid")?;
         Self::write_prekey(&profile.slug, &export.prekey_bundle)?;
-        if let Some(identity_b64) = &export.identity_key {
-            use base64::Engine;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(identity_b64)
-                .context("Identity key inside the profile is not valid base64")?;
-            let text = String::from_utf8(bytes)
-                .context("Identity key inside the profile is not valid UTF-8")?;
-            let path = Self::write_identity(&profile.slug, &text)?;
-            // Validate by loading; drop the file again if it is garbage.
-            if let Err(e) = rvpn_core::crypto::IdentityKey::load(&path) {
-                let _ = std::fs::remove_file(&path);
-                bail!("Identity key inside the profile is invalid: {e}");
+
+        let dir = profile.dir();
+        match &export.identity_key {
+            Some(identity_b64) => {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(identity_b64)
+                    .context("Identity key inside the profile is not valid base64")?;
+                let text = String::from_utf8(bytes)
+                    .context("Identity key inside the profile is not valid UTF-8")?;
+                let path = Self::write_identity(&profile.slug, &text)?;
+                // Validate by loading; drop the file again if it is garbage.
+                if let Err(e) = rvpn_core::crypto::IdentityKey::load(&path) {
+                    let _ = std::fs::remove_file(&path);
+                    bail!("Identity key inside the profile is invalid: {e}");
+                }
+            }
+            None => {
+                if !dir.join("identity.key").is_file() {
+                    crate::identity::generate_identity(&dir.join("identity.key"))
+                        .context("failed to generate a fresh identity for the imported profile")?;
+                }
             }
         }
         Ok(profile)
