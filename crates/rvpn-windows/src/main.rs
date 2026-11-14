@@ -16,6 +16,10 @@ fn main() -> eframe::Result<()> {
 
     rvpn_windows::paths::ensure_dirs().expect("failed to create %APPDATA% directories");
 
+    // Self-healing: clean NRPT rules a crashed/killed previous run may have
+    // left behind (they hold the system resolver hostage after disconnect).
+    rvpn_windows::winroute::sweep_stale_state();
+
     // Logging: GUI ring + capped file. Set RVPN_LOG_LEVEL=debug|trace for
     // engine diagnostics (same variable the upstream apps honour).
     let ring = rvpn_windows::logging::LogRing::default();

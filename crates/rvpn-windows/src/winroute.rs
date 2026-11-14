@@ -205,21 +205,36 @@ pub fn add_nrpt_rule() -> RouteState {
     state
 }
 
-/// Revert everything that does not die with the adapter itself.
-pub fn revert(state: &RouteState) {
-    if state.nrpt_added {
-        run_best_effort(
-            "powershell",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-DnsClientNrptRule -ErrorAction SilentlyContinue | \
-                 Where-Object { $_.NameServer -eq '127.0.0.1' } | \
-                 Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue",
-            ],
-        );
-    }
+/// Remove every leftover NRPT rule this app may have created — the catch-all
+/// `.` rules pointing at the loopback resolver. NOTE the property is the
+/// PLURAL `NameServers` (filtering on `NameServer` silently matched nothing,
+/// which is exactly how rules leaked and held the system resolver hostage
+/// after disconnect).
+fn sweep_nrpt_rules() {
+    run_best_effort(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-DnsClientNrptRule -ErrorAction SilentlyContinue | \
+             Where-Object { ($_.Namespace -contains '.') -and \
+                            ($_.NameServers -contains '127.0.0.1' -or -not $_.NameServers) } | \
+             Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue",
+        ],
+    );
+}
+
+/// Startup self-healing: rules can survive a crash or a forced process kill.
+pub fn sweep_stale_state() {
+    sweep_nrpt_rules();
+    run_best_effort("ipconfig", &["/flushdns"]);
+}
+
+/// Revert everything that does not die with the adapter itself. The sweep is
+/// unconditional — belt and braces over the recorded `nrpt_added` flag.
+pub fn revert(_state: &RouteState) {
+    sweep_nrpt_rules();
     run_best_effort("ipconfig", &["/flushdns"]);
 }
 

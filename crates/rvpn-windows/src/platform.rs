@@ -37,7 +37,11 @@ pub struct SingleInstance {
 
 impl SingleInstance {
     pub fn try_acquire() -> Option<Self> {
-        let name: Vec<u16> = "Global\\rvpn-windows-singleton\0".encode_utf16().collect();
+        Self::acquire_named("Global\\rvpn-windows-singleton")
+    }
+
+    fn acquire_named(name: &str) -> Option<Self> {
+        let name: Vec<u16> = format!("{name}\0").encode_utf16().collect();
         unsafe {
             let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
             // CreateMutexW returns a valid handle even on ERROR_ALREADY_EXISTS;
@@ -109,12 +113,21 @@ mod tests {
 
     #[test]
     fn single_instance_mutex_roundtrip() {
-        let first = SingleInstance::try_acquire();
+        // A private mutex name: the real app instance (often running while
+        // tests execute) legitimately holds the production name.
+        let test_name = format!(
+            "Global\\rvpn-windows-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let first = SingleInstance::acquire_named(&test_name);
         assert!(first.is_some());
-        let second = SingleInstance::try_acquire();
+        let second = SingleInstance::acquire_named(&test_name);
         assert!(second.is_none());
         drop(first);
-        let third = SingleInstance::try_acquire();
+        let third = SingleInstance::acquire_named(&test_name);
         assert!(third.is_some());
     }
 }
