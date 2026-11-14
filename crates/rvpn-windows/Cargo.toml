@@ -47,8 +47,15 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 [build-dependencies]
 winres = "0.1"
 
+[features]
+# Embed the requireAdministrator manifest (default for shipped builds).
+# Tests opt out: `cargo test --release --no-default-features`.
+default = ["admin-manifest"]
+admin-manifest = []
+
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [package.metadata.winres]
 FileDescription = "R-VPN Client for Windows"

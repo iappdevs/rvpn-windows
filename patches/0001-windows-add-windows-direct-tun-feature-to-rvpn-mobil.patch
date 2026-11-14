@@ -1,7 +1,7 @@
 From bf9d63a500e097ff18c124e3b2ed50b093c6da53 Mon Sep 17 00:00:00 2001
 From: Amir <gilaniamirhossein@gmail.com>
 Date: Sat, 14 Nov 2026 12:45:09 +0330
-Subject: [PATCH] windows: add windows-direct-tun feature to rvpn-mobile
+Subject: [PATCH 1/2] windows: add windows-direct-tun feature to rvpn-mobile
 
 - New cargo feature windows-direct-tun: rustls TLS backend (same as iOS
   production), dns, and the direct-TUN host-agnostic engine modules.

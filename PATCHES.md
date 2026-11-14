@@ -1,16 +1,28 @@
 # Patches to rVPN-core (upstream)
 
 The Windows client depends on a small, surgical patch set against
-[`PDG-Global/rVPN-core`](https://github.com/PDG-Global/rVPN-core) that adds a
-`windows-direct-tun` feature to the `rvpn-mobile` crate. It is committed on
-the `windows-client` branch of the sibling `../rVPN-core` checkout. Every
-change is additive and does not alter any existing platform's behaviour.
+[`PDG-Global/rVPN-core`](https://github.com/PDG-Global/rVPN-core). It is
+committed on the `windows-client` branch of the sibling `../rVPN-core`
+checkout, and mirrored in `patches/` here.
 
-Generate the patch at any time with:
+Two commits:
 
-```bash
-cd ../rVPN-core && git format-patch main..windows-client -o ../rvpn-windows/patches
-```
+1. `windows-direct-tun` feature on `rvpn-mobile` (porting + gating; see below).
+2. **A genuine upstream bug fix** — `MinimalWsReader::next_frame` parsed a
+   frame only after a *successful* read. When one TCP segment delivered
+   several WebSocket frames (e.g. a data batch right behind the server's
+   keepalive ping), the frames after the first were stuck: the parser waited
+   for a new segment — forever, or until misreporting EOF at close. This
+   stalls the mobile downlink in the field; the fix parses the buffer
+   before reading, and is covered by a new unit test
+   (`ws::frame_stream_tests::next_frame_parses_back_to_back_frames_in_one_segment`).
+
+## Extra-root TLS deployments
+
+`rvpn-tls` (rustls backend) accepts `RVPN_TLS_ROOT_CA=/path/to.pem` to
+append extra trust roots — for servers terminating TLS with a private CA or
+a direct-IP certificate (no public CA issues certificates for bare IPs, so
+a domain + Let's Encrypt remains the recommended production setup).
 
 ## Summary of changes
 
@@ -59,6 +71,15 @@ cd ../rVPN-core && git format-patch main..windows-client -o ../rvpn-windows/patc
   loopback DoH DNS proxy natively in-process (the Windows client does).
 - The non-diagnostics `rvpn_tun_get_rss_bytes` Mach reader is now Apple-only
   (no Mach on Windows).
+
+### 7. `rvpn/crates/rvpn-mobile/src/ws.rs` (upstream bug fix)
+
+- `MinimalWsReader::next_frame` extracted a `try_parse_frame` helper and
+  parses buffered frames **before** waiting on the stream (commit 2 above).
+
+### 8. `rvpn/crates/rvpn-tls` (rustls backend)
+
+- Optional `RVPN_TLS_ROOT_CA` extra roots via `rustls-pemfile` (see above).
 
 ## Why rustls instead of BoringSSL on Windows?
 

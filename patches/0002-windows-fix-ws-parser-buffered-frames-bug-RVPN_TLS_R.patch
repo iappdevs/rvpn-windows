@@ -1,0 +1,317 @@
+From c88bc17c7d7d686191e156d410a3137937c8404e Mon Sep 17 00:00:00 2001
+From: Amir <gilaniamirhossein@gmail.com>
+Date: Sat, 14 Nov 2026 14:45:27 +0330
+Subject: [PATCH 2/2] windows + fix: ws parser buffered-frames bug;
+ RVPN_TLS_ROOT_CA extra roots
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- MinimalWsReader::next_frame now parses the read buffer BEFORE reading
+  more bytes. Previously, when one TCP segment delivered several frames
+  (e.g. a data batch right behind the server's keepalive ping), the
+  frames after the first were stuck: the parser waited for a new segment
+  (or reported EOF) instead of returning the already-buffered frames.
+  This stalled the downlink permanently in the field. Reproduced by a
+  new unit test (binary/ping/binary in one segment, then EOF).
+- rvpn-tls (rustls backend): optional RVPN_TLS_ROOT_CA=path env adds
+  extra PEM roots — for self-hosted deployments terminating TLS with a
+  private CA or direct-IP self-signed certs (no public CA issues bare-IP
+  certificates). deps: rustls-pemfile behind the rustls feature.
+---
+ rvpn/Cargo.lock                        |   1 +
+ rvpn/crates/rvpn-mobile/src/ws.rs      | 185 ++++++++++++++++---------
+ rvpn/crates/rvpn-tls/Cargo.toml        |   4 +-
+ rvpn/crates/rvpn-tls/src/tls_rustls.rs |  19 +++
+ 4 files changed, 143 insertions(+), 66 deletions(-)
+
+diff --git a/rvpn/Cargo.lock b/rvpn/Cargo.lock
+index b988bd4..c347ad5 100644
+--- a/rvpn/Cargo.lock
++++ b/rvpn/Cargo.lock
+@@ -2698,6 +2698,7 @@ dependencies = [
+  "native-tls",
+  "rcgen 0.13.2",
+  "rustls 0.22.4",
++ "rustls-pemfile",
+  "serde",
+  "socket2 0.5.10",
+  "tokio",
+diff --git a/rvpn/crates/rvpn-mobile/src/ws.rs b/rvpn/crates/rvpn-mobile/src/ws.rs
+index 14a315a..1c8c42b 100644
+--- a/rvpn/crates/rvpn-mobile/src/ws.rs
++++ b/rvpn/crates/rvpn-mobile/src/ws.rs
+@@ -171,12 +171,23 @@ pub struct MinimalWsReader<S> {
+ }
+ 
+ impl<S: AsyncRead + Unpin> MinimalWsReader<S> {
+-    /// Read the next WebSocket frame into the caller-provided buffer.
++    /// Read the next WebSocket frame into the caller's provided buffer.
+     ///
+     /// Returns the frame type and the number of payload bytes written to `out`.
+     /// For Ping frames, call `send_pong` on the writer with `&out[..len]`.
++    ///
++    /// The read buffer is parsed FIRST: when a TCP segment delivered several
++    /// frames at once (e.g. a data batch right behind the server's keepalive
++    /// ping), the already-buffered frames must be returned before waiting for
++    /// — or giving up on — more bytes from the stream. Parsing only after a
++    /// successful read made the second buffered frame wait forever for the
++    /// next segment (or be misreported as EOF at stream close).
+     pub async fn next_frame(&mut self, out: &mut [u8]) -> Result<(FrameType, usize)> {
+         loop {
++            if let Some(frame) = self.try_parse_frame(out)? {
++                return Ok(frame);
++            }
++
+             // Append new bytes from the TLS stream into the read buffer.
+             // `read_buf` (bytes::BufMut) extends the Vec's length as it writes,
+             // which is what we need. The previous code used `AsyncReadExt::read`
+@@ -187,81 +198,86 @@ impl<S: AsyncRead + Unpin> MinimalWsReader<S> {
+             let before = self.read_buf.len();
+             self.reader.read_buf(&mut self.read_buf).await?;
+             if self.read_buf.len() == before {
+-                // No new bytes: true EOF.
++                // No new bytes and no complete buffered frame: true EOF.
+                 anyhow::bail!("Connection closed (EOF)");
+             }
++        }
++    }
+ 
+-            if self.read_buf.len() < 2 {
+-                continue;
+-            }
++    /// Parse one complete frame off the front of `read_buf`, if any.
++    ///
++    /// `Ok(None)` = only a partial frame is buffered (or nothing at all) —
++    /// the caller needs to read more bytes. `Err` = protocol violation.
++    fn try_parse_frame(&mut self, out: &mut [u8]) -> Result<Option<(FrameType, usize)>> {
++        if self.read_buf.len() < 2 {
++            return Ok(None);
++        }
+ 
+-            let opcode = self.read_buf[0] & 0x0F;
+-            if self.read_buf[1] & 0x80 != 0 {
+-                anyhow::bail!("Server sent masked frame (protocol violation)");
+-            }
++        let opcode = self.read_buf[0] & 0x0F;
++        if self.read_buf[1] & 0x80 != 0 {
++            anyhow::bail!("Server sent masked frame (protocol violation)");
++        }
+ 
+-            let (payload_len, hdr_len) = match self.read_buf[1] & 0x7F {
+-                len @ 0..=125 => (len as usize, 2),
+-                126 => {
+-                    if self.read_buf.len() < 4 {
+-                        continue;
+-                    }
+-                    let len = u16::from_be_bytes([self.read_buf[2], self.read_buf[3]]) as usize;
+-                    (len, 4)
++        let (payload_len, hdr_len) = match self.read_buf[1] & 0x7F {
++            len @ 0..=125 => (len as usize, 2),
++            126 => {
++                if self.read_buf.len() < 4 {
++                    return Ok(None);
+                 }
+-                127 => {
+-                    if self.read_buf.len() < 10 {
+-                        continue;
+-                    }
+-                    let len = u64::from_be_bytes([
+-                        self.read_buf[2], self.read_buf[3], self.read_buf[4], self.read_buf[5],
+-                        self.read_buf[6], self.read_buf[7], self.read_buf[8], self.read_buf[9],
+-                    ]) as usize;
+-                    (len, 10)
++                let len = u16::from_be_bytes([self.read_buf[2], self.read_buf[3]]) as usize;
++                (len, 4)
++            }
++            127 => {
++                if self.read_buf.len() < 10 {
++                    return Ok(None);
+                 }
+-                _ => unreachable!("masked by 0x7F"),
+-            };
+-
+-            let frame_end = hdr_len + payload_len;
+-            if self.read_buf.len() < frame_end {
+-                self.read_buf.reserve(frame_end - self.read_buf.len());
+-                continue;
++                let len = u64::from_be_bytes([
++                    self.read_buf[2], self.read_buf[3], self.read_buf[4], self.read_buf[5],
++                    self.read_buf[6], self.read_buf[7], self.read_buf[8], self.read_buf[9],
++                ]) as usize;
++                (len, 10)
+             }
++            _ => unreachable!("masked by 0x7F"),
++        };
+ 
+-            if payload_len > out.len() {
+-                anyhow::bail!(
+-                    "Frame payload ({} bytes) exceeds output buffer ({} bytes)",
+-                    payload_len,
+-                    out.len()
+-                );
+-            }
++        let frame_end = hdr_len + payload_len;
++        if self.read_buf.len() < frame_end {
++            self.read_buf.reserve(frame_end - self.read_buf.len());
++            return Ok(None);
++        }
+ 
+-            match opcode {
+-                0x02 => {
+-                    out[..payload_len]
+-                        .copy_from_slice(&self.read_buf[hdr_len..hdr_len + payload_len]);
+-                    self.read_buf.drain(..frame_end);
+-                    return Ok((FrameType::Binary, payload_len));
+-                }
+-                0x09 => {
+-                    out[..payload_len]
+-                        .copy_from_slice(&self.read_buf[hdr_len..hdr_len + payload_len]);
+-                    self.read_buf.drain(..frame_end);
+-                    return Ok((FrameType::Ping, payload_len));
+-                }
+-                0x08 => {
+-                    self.read_buf.drain(..frame_end);
+-                    return Ok((FrameType::Close, 0));
+-                }
+-                0x0A => {
+-                    self.read_buf.drain(..frame_end);
+-                    return Ok((FrameType::Pong, 0));
+-                }
+-                other => {
+-                    anyhow::bail!("Unsupported WebSocket opcode: 0x{:02X}", other);
+-                }
+-            }
++        if payload_len > out.len() {
++            anyhow::bail!(
++                "Frame payload ({} bytes) exceeds output buffer ({} bytes)",
++                payload_len,
++                out.len()
++            );
+         }
++
++        let frame = match opcode {
++            0x02 => {
++                out[..payload_len].copy_from_slice(&self.read_buf[hdr_len..hdr_len + payload_len]);
++                self.read_buf.drain(..frame_end);
++                (FrameType::Binary, payload_len)
++            }
++            0x09 => {
++                out[..payload_len].copy_from_slice(&self.read_buf[hdr_len..hdr_len + payload_len]);
++                self.read_buf.drain(..frame_end);
++                (FrameType::Ping, payload_len)
++            }
++            0x08 => {
++                self.read_buf.drain(..frame_end);
++                (FrameType::Close, 0)
++            }
++            0x0A => {
++                self.read_buf.drain(..frame_end);
++                (FrameType::Pong, 0)
++            }
++            other => {
++                anyhow::bail!("Unsupported WebSocket opcode: 0x{:02X}", other);
++            }
++        };
++        Ok(Some(frame))
+     }
+ }
+ 
+@@ -513,3 +529,42 @@ mod tests {
+         bytes.iter().map(|b| format!("{:02x}", b)).collect()
+     }
+ }
++
++#[cfg(test)]
++mod frame_stream_tests {
++    use super::*;
++
++    /// Frames delivered back-to-back in ONE TCP segment must all be parsed —
++    /// including a Ping landing between two Binaries (the production relay
++    /// sees exactly this after a server keepalive).
++    #[tokio::test]
++    async fn next_frame_parses_back_to_back_frames_in_one_segment() {
++        use tokio::io::AsyncWriteExt;
++
++        let (mut fake_wire, our_side) = tokio::io::duplex(4096);
++        let (our_read, _our_write) = tokio::io::split(our_side);
++        let mut reader = MinimalWsReader {
++            reader: our_read,
++            read_buf: Vec::new(),
++        };
++
++        // binary("abc") + ping(2 bytes) + binary("de")
++        let mut data = vec![0x82, 0x03, b'a', b'b', b'c'];
++        data.extend_from_slice(&[0x89, 0x02, 0x11, 0x22]);
++        data.extend_from_slice(&[0x82, 0x02, b'd', b'e']);
++        fake_wire.write_all(&data).await.unwrap();
++        drop(fake_wire); // EOF after the frames — parser must not need more bytes
++
++        let mut out = vec![0u8; 256];
++        let (t1, n1) = reader.next_frame(&mut out).await.expect("frame 1");
++        assert_eq!((t1, n1), (FrameType::Binary, 3));
++        assert_eq!(&out[..n1], b"abc");
++
++        let (t2, n2) = reader.next_frame(&mut out).await.expect("frame 2");
++        assert_eq!((t2, n2), (FrameType::Ping, 2));
++
++        let (t3, n3) = reader.next_frame(&mut out).await.expect("frame 3");
++        assert_eq!((t3, n3), (FrameType::Binary, 2));
++        assert_eq!(&out[..n3], b"de");
++    }
++}
+diff --git a/rvpn/crates/rvpn-tls/Cargo.toml b/rvpn/crates/rvpn-tls/Cargo.toml
+index 147dce5..129f28e 100644
+--- a/rvpn/crates/rvpn-tls/Cargo.toml
++++ b/rvpn/crates/rvpn-tls/Cargo.toml
+@@ -41,6 +41,8 @@ tokio-boring = { workspace = true, optional = true }
+ rustls = { workspace = true, optional = true }
+ tokio-rustls = { workspace = true, optional = true }
+ webpki-roots = { version = "0.26", optional = true }
++# PEM parsing for the optional RVPN_TLS_ROOT_CA extra-root deployment path.
++rustls-pemfile = { version = "2", optional = true }
+ 
+ # --- Backend: native-tls (platform TLS via Security.framework on iOS/macOS) ---
+ # Proof-of-concept for iOS: uses Apple's own TLS, eliminating BoringSSL entirely.
+@@ -52,7 +54,7 @@ tokio-native-tls = { version = "0.3", optional = true }
+ # Default keeps current behavior: desktop client (rvpn-client) and macOS use boring.
+ default = ["boring"]
+ boring = ["dep:boring", "dep:tokio-boring"]
+-rustls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
++rustls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+ native-tls = ["dep:native-tls", "dep:tokio-native-tls"]
+ 
+ [dev-dependencies]
+diff --git a/rvpn/crates/rvpn-tls/src/tls_rustls.rs b/rvpn/crates/rvpn-tls/src/tls_rustls.rs
+index 59afbe5..c9770d7 100644
+--- a/rvpn/crates/rvpn-tls/src/tls_rustls.rs
++++ b/rvpn/crates/rvpn-tls/src/tls_rustls.rs
+@@ -129,6 +129,25 @@ fn build_client_config(resumption: Option<&ResumptionStore>) -> Result<Arc<rustl
+     let mut root_store = rustls::RootCertStore::empty();
+     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+ 
++    // Optional extra roots for self-hosted deployments that terminate TLS
++    // with a private CA or a direct-IP self-signed certificate (no public
++    // CA issues certs for bare IPs). RVPN_TLS_ROOT_CA=/path/to/ca-or-cert.pem
++    // appends every certificate in the PEM to the root store.
++    if let Ok(path) = std::env::var("RVPN_TLS_ROOT_CA") {
++        match std::fs::read(&path) {
++            Ok(pem) => {
++                let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&pem))
++                    .collect::<Result<_, _>>()
++                    .context("RVPN_TLS_ROOT_CA: invalid PEM")?;
++                let (added, _) = root_store.add_parsable_certificates(certs);
++                tracing::info!(path, added, "RVPN_TLS_ROOT_CA: appended extra TLS roots");
++            }
++            Err(e) => {
++                tracing::error!("RVPN_TLS_ROOT_CA is set but unreadable ({path}): {e}");
++            }
++        }
++    }
++
+     // Build a Chrome-order CryptoProvider on top of the ring provider so the
+     // ClientHello's cipher_suites and kx_groups lists match Chrome-on-TLS-1.3.
+     //
+-- 
+2.51.0.windows.1
+
