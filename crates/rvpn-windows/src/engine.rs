@@ -21,7 +21,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -73,14 +73,12 @@ pub struct EngineSnapshot {
 }
 
 /// Where events are pushed (single engine at a time, like the mobile apps).
-static EVENT_SINK: OnceLock<Mutex<Option<std::sync::mpsc::Sender<EngineEvent>>>> = OnceLock::new();
+static EVENT_SINK: Mutex<Option<std::sync::mpsc::Sender<EngineEvent>>> = Mutex::new(None);
 
 fn send_event(ev: EngineEvent) {
-    if let Some(sink) = EVENT_SINK.get() {
-        if let Ok(guard) = sink.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.send(ev);
-            }
+    if let Ok(guard) = EVENT_SINK.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ev);
         }
     }
 }
@@ -155,7 +153,7 @@ impl EngineHandle {
         profile: &Profile,
         events: std::sync::mpsc::Sender<EngineEvent>,
     ) -> EngineHandle {
-        let _ = EVENT_SINK.set(Mutex::new(Some(events)));
+        *EVENT_SINK.lock().unwrap() = Some(events);
 
         let handle = EngineHandle {
             inner: Arc::new(EngineInner {
@@ -416,13 +414,24 @@ impl EngineHandle {
             });
         }
 
+        // Route the system through the proxy (browsers follow WinINET).
+        // Best-effort: without it the user must configure apps by hand.
+        if let Err(e) = crate::sysproxy::set_system_proxy("127.0.0.1", profile.proxy_port) {
+            tracing::warn!(error = %format!("{e:#}"), "could not set the system proxy");
+            send_event(EngineEvent::Notice(
+                "Could not set the system proxy — configure your browser to \
+                 socks5://127.0.0.1:<port> manually."
+                    .into(),
+            ));
+        }
+
         self.set_phase(EnginePhase::Connected {
             ip: format!("socks5://{local_addr}"),
             gateway: "bypass rules active".into(),
             server: profile.server_address.clone(),
         });
         send_event(EngineEvent::Notice(format!(
-            "SOCKS5 proxy on {local_addr} — set your browser/apps to it (bypass rules applied)"
+            "SOCKS5 proxy on {local_addr} — the system proxy is set to it (bypass rules applied)"
         )));
         Ok(())
     }
@@ -793,8 +802,8 @@ fn teardown_inner(inner: &EngineInner) {
 
     tracing::info!("tearing the tunnel down");
 
-    // Proxy mode: stop the SOCKS5 listener and the flow pump, then the
-    // runtime drops below. Nothing OS-level to undo.
+    // Proxy mode: stop the SOCKS5 listener and the flow pump, restore the
+    // system proxy, then the runtime drops below.
     if let Some(proxy) = t.proxy.take() {
         if let Some(rt) = t.runtime.as_ref() {
             rt.block_on(proxy.socks.stop());
@@ -802,6 +811,7 @@ fn teardown_inner(inner: &EngineInner) {
         proxy.flow_task.abort();
         proxy.udp_task.abort();
         t.runtime = None;
+        crate::sysproxy::restore_system_proxy();
         tracing::info!("proxy mode teardown complete");
         return;
     }

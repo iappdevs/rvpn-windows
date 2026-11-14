@@ -176,3 +176,87 @@ fn proxy_mode_tunnel_and_bypass() {
         "E2E PROXY PASS — tunnel exits via {tun_ip}, bypass exits via {direct_ip} (direct internet)"
     );
 }
+
+/// Minimal SOCKS4a CONNECT + HTTP GET through the local proxy (the dialect
+/// Windows' system proxy actually speaks).
+fn socks4_http_get(proxy_port: u16, host: &str, path: &str) -> String {
+    use std::io::{Read, Write};
+
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect proxy");
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+
+    // SOCKS4a: [VER=4][CMD=1][PORT][0.0.0.x][USERID\0][DOMAIN\0]
+    let mut req = vec![0x04, 0x01];
+    req.extend_from_slice(&80u16.to_be_bytes());
+    req.extend_from_slice(&[0, 0, 0, 1]); // 4a marker
+    req.push(0); // empty user id
+    req.extend_from_slice(host.as_bytes());
+    req.push(0);
+    s.write_all(&req).unwrap();
+
+    let mut resp = [0u8; 8];
+    s.read_exact(&mut resp).unwrap();
+    assert_eq!(resp[1], 0x5A, "SOCKS4 CONNECT granted");
+
+    let http = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: curl\r\n\r\n");
+    s.write_all(http.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[test]
+#[ignore = "needs a live rVPN server"]
+fn proxy_mode_socks4_system_dialect() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_target(false)
+        .try_init();
+
+    let mut profile = Profile::new("proxy e2e s4");
+    let pdir = rvpn_windows::paths::profile_dir(&profile.slug);
+    std::fs::create_dir_all(&pdir).unwrap();
+    rvpn_windows::identity::generate_identity(&pdir.join("identity.key")).unwrap();
+    std::fs::write(
+        pdir.join("prekey-bundle.json"),
+        include_str!("../../../assets/dl99aa-prekey.json"),
+    )
+    .unwrap();
+
+    let port = pick_free_port();
+    profile.mode = ConnMode::Proxy;
+    profile.proxy_port = port;
+    profile.server_address = server_address();
+
+    let (tx, rx) = mpsc::channel::<EngineEvent>();
+    let connect_handle = std::thread::spawn(move || EngineHandle::connect(&profile, tx));
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut connected = false;
+    while Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(EngineEvent::Phase(EnginePhase::Connected { .. })) => {
+                connected = true;
+                break;
+            }
+            Ok(EngineEvent::Phase(EnginePhase::Failed { reason })) => {
+                panic!("proxy connect failed: {reason}");
+            }
+            Ok(_) => {}
+            Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(100)),
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    assert!(connected, "proxy mode did not reach Connected");
+
+    let http = socks4_http_get(port, "api.ipify.org", "/");
+    let ip = extract_ip(&http);
+    let engine = connect_handle.join().unwrap();
+    engine.stop();
+    assert!(
+        ip.parse::<std::net::Ipv4Addr>().is_ok(),
+        "SOCKS4 path returned nothing useful: {http:?}"
+    );
+    assert_ne!(ip, "127.0.0.1");
+    println!("E2E SOCKS4 PASS — system dialect exits via {ip}");
+}

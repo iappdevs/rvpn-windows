@@ -5,17 +5,19 @@ The Windows client depends on a small, surgical patch set against
 committed on the `windows-client` branch of the sibling `../rVPN-core`
 checkout, and mirrored in `patches/` here.
 
-Two commits:
+Highlights:
 
 1. `windows-direct-tun` feature on `rvpn-mobile` (porting + gating; see below).
-2. **A genuine upstream bug fix** — `MinimalWsReader::next_frame` parsed a
-   frame only after a *successful* read. When one TCP segment delivered
-   several WebSocket frames (e.g. a data batch right behind the server's
-   keepalive ping), the frames after the first were stuck: the parser waited
-   for a new segment — forever, or until misreporting EOF at close. This
-   stalls the mobile downlink in the field; the fix parses the buffer
-   before reading, and is covered by a new unit test
-   (`ws::frame_stream_tests::next_frame_parses_back_to_back_frames_in_one_segment`).
+2. **Upstream bug fix** — `MinimalWsReader::next_frame` parsed a frame only
+   after a *successful* read; frames delivered behind the first in one TCP
+   segment were stuck forever. Fixed with a parse-before-read loop and a
+   regression unit test.
+3. **Proxy mode (SOCKS5/4a frontend + per-flow relay)** — the in-tree
+   `socks5_server` was dead code (never declared) and its Bypass path only
+   answered with a SOCKS error for iOS to retry; `flow_connector`'s framing
+   was broken (JSON instead of binary, no padding). Both now work end-to-end
+   and SOCKS4/4a — the dialect Windows' own system proxy speaks — is
+   accepted, so proxy mode can drive the WinINET system proxy.
 
 ## Extra-root TLS deployments
 

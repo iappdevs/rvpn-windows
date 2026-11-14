@@ -17,8 +17,10 @@ fn main() -> eframe::Result<()> {
     rvpn_windows::paths::ensure_dirs().expect("failed to create %APPDATA% directories");
 
     // Self-healing: clean NRPT rules a crashed/killed previous run may have
-    // left behind (they hold the system resolver hostage after disconnect).
+    // left behind (they hold the system resolver hostage after disconnect),
+    // and restore the system proxy if a proxy session died uncleanly.
     rvpn_windows::winroute::sweep_stale_state();
+    rvpn_windows::sysproxy::sweep_stale_system_proxy();
 
     // Logging: GUI ring + capped file. Set RVPN_LOG_LEVEL=debug|trace for
     // engine diagnostics (same variable the upstream apps honour).

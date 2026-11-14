@@ -8,6 +8,7 @@ pub mod logging;
 pub mod paths;
 pub mod platform;
 pub mod profile;
+pub mod sysproxy;
 pub mod tray;
 pub mod tundevice;
 pub mod winroute;
