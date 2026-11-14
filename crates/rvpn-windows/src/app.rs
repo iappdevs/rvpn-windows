@@ -10,7 +10,7 @@ use eframe::egui::{Align2, Color32, Layout, RichText, Sense, Vec2};
 use crate::engine::{EngineEvent, EngineHandle, EnginePhase, EngineSnapshot};
 use crate::logging::LogRing;
 use crate::platform;
-use crate::profile::{AppSettings, Profile, ProfileStore, MAX_PROFILES};
+use crate::profile::{AppSettings, ConnMode, Profile, ProfileStore, MAX_PROFILES};
 use crate::tray::{Tray, TrayCommand};
 
 const ACCENT: Color32 = Color32::from_rgb(46, 184, 114);
@@ -39,6 +39,7 @@ enum PickerPurpose {
     ImportIdentity,
     ImportProfile,
     ExportProfile,
+    ImportIpDb,
 }
 
 pub struct RvpnApp {
@@ -324,6 +325,38 @@ impl RvpnApp {
                     }
                 }
             }
+            (PickerPurpose::ImportIpDb, Some((_path, contents))) => {
+                // Validate {"CC": ["cidr", …]} then store next to the profile.
+                match serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&contents)
+                {
+                    Ok(db) if !db.is_empty() => {
+                        let total: usize = db.values().map(|v| v.len()).sum();
+                        let dir = crate::paths::profile_dir(&picker.slug);
+                        let _ = std::fs::create_dir_all(&dir);
+                        let file = dir.join("country-ips.json");
+                        if let Err(e) = std::fs::write(&file, &contents) {
+                            self.flash(format!("Failed to store IP database: {e}"), DANGER);
+                        } else if let Some(p) =
+                            self.profiles.iter_mut().find(|p| p.slug == picker.slug)
+                        {
+                            p.country_ips_file = Some("country-ips.json".into());
+                            let _ = ProfileStore::save(&self.profiles);
+                            self.flash(
+                                format!("IP database loaded ({total} CIDRs) — saved to profile"),
+                                ACCENT,
+                            );
+                            self.editing = None; // re-open editor to refresh the badge
+                        } else if let Some(edit) = self.editing.as_mut() {
+                            if edit.slug == picker.slug {
+                                edit.country_ips_file = Some("country-ips.json".into());
+                            }
+                            self.flash(format!("IP database loaded ({total} CIDRs)"), ACCENT);
+                        }
+                    }
+                    Ok(_) => self.flash("IP database file is empty", WARN),
+                    Err(e) => self.flash(format!("Not a valid IP database JSON: {e}"), DANGER),
+                }
+            }
             _ => {}
         }
     }
@@ -551,7 +584,22 @@ impl RvpnApp {
                 self.start_connect();
             }
         }
-        if !platform::is_elevated() {
+
+        let proxy_mode = self.selected().is_some_and(|p| p.mode == ConnMode::Proxy);
+        if proxy_mode {
+            if let EnginePhase::Connected { .. } = &self.snapshot.phase {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Set your browser/apps to SOCKS5 127.0.0.1:{} — \
+                         bypassed hosts (IR rules) go direct, the rest through the tunnel.",
+                        self.selected().map(|p| p.proxy_port).unwrap_or(1080)
+                    ))
+                    .small()
+                    .color(ACCENT),
+                );
+            }
+        } else if !platform::is_elevated() {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
@@ -834,6 +882,35 @@ impl RvpnApp {
                     );
                     ui.end_row();
 
+                    ui.label("Mode");
+                    ui.horizontal(|ui| {
+                        let tun = editing.mode == ConnMode::Tun;
+                        if ui.selectable_label(tun, "Full tunnel (TUN)").clicked() {
+                            editing.mode = ConnMode::Tun;
+                        }
+                        if ui.selectable_label(!tun, "SOCKS5 proxy").clicked() {
+                            editing.mode = ConnMode::Proxy;
+                        }
+                    });
+                    ui.end_row();
+
+                    if editing.mode == ConnMode::Proxy {
+                        ui.label("Proxy port");
+                        ui.add(egui::DragValue::new(&mut editing.proxy_port).range(1024..=65535));
+                        ui.end_row();
+
+                        ui.label("Bypass resolvers");
+                        let mut bypass_dns = editing.bypass_dns_servers.join(", ");
+                        ui.text_edit_singleline(&mut bypass_dns)
+                            .on_hover_text("DNS servers used for direct (bypassed) domains — local/normal internet");
+                        editing.bypass_dns_servers = bypass_dns
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        ui.end_row();
+                    }
+
                     ui.label("SNI override");
                     ui.add_enabled(
                         false,
@@ -871,12 +948,16 @@ impl RvpnApp {
                 });
 
             ui.add_space(6.0);
-            ui.checkbox(&mut editing.split_tunnel_enabled, "Split tunnel (bypass countries)");
+            ui.checkbox(
+                &mut editing.split_tunnel_enabled,
+                "Split tunnel (bypass rules — direct internet)",
+            );
             if editing.split_tunnel_enabled {
-                let countries = rvpn_mobile::rvpn_split_tunnel::supported_countries();
                 ui.horizontal(|ui| {
                     ui.label("Bypass countries:");
-                    for code in countries {
+                    // IR has no compiled-in ranges — the custom database below
+                    // supplies them; other codes use the builtin data.
+                    for code in ["IR"].iter().chain(rvpn_mobile::rvpn_split_tunnel::supported_countries().iter()) {
                         let on = editing.builtin_bypass_countries.iter().any(|c| c == code);
                         if ui
                             .selectable_label(on, RichText::new(*code).small())
@@ -888,6 +969,53 @@ impl RvpnApp {
                                 editing.builtin_bypass_countries.push(code.to_string());
                             }
                         }
+                    }
+                });
+                if editing.builtin_bypass_countries.contains(&"IR".to_string())
+                    && editing.country_ips_file.is_none()
+                {
+                    ui.label(
+                        RichText::new(
+                            "⚠ IR selected but no IR IP database loaded — import one below, \
+                             otherwise IR has no builtin ranges.",
+                        )
+                        .small()
+                        .color(WARN),
+                    );
+                }
+
+                ui.label("Bypass domains (one per line):");
+                let mut domains = editing.bypass_domains.join("\n");
+                ui.add(
+                    egui::TextEdit::multiline(&mut domains)
+                        .hint_text("digikala.com\naparat.com\n*.ir")
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                editing.bypass_domains = domains
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+
+                ui.horizontal(|ui| {
+                    if ui.button("Import IP database…").clicked() {
+                        self.spawn_picker(PickerPurpose::ImportIpDb, editing.slug.clone(), None);
+                    }
+                    if editing.country_ips_file.is_some() {
+                        ui.label(RichText::new("✓ custom IP database loaded").color(ACCENT).small());
+                        if ui.button("Remove").clicked() {
+                            let _ = std::fs::remove_file(
+                                editing.dir().join(editing.country_ips_file.clone().unwrap()),
+                            );
+                            editing.country_ips_file = None;
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("JSON {\"CC\": [\"cidr\", …]} — e.g. an updated IR list")
+                                .small()
+                                .color(Color32::from_gray(120)),
+                        );
                     }
                 });
             }

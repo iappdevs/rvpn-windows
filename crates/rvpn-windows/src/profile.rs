@@ -22,8 +22,23 @@ pub struct Profile {
     pub slug: String,
     /// Display name.
     pub name: String,
+    /// Connection mode: full TUN (default) or local SOCKS5 proxy.
+    #[serde(default)]
+    pub mode: ConnMode,
     /// Server WebSocket address, e.g. `wss://sg.example.com:443/api/v1/ws/tun`.
     pub server_address: String,
+    /// Local SOCKS5 port for proxy mode (listens on 127.0.0.1).
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
+    /// Resolvers used for bypassed (direct) domains in proxy mode —
+    /// should be reachable from the local/normal internet.
+    #[serde(default = "default_bypass_dns")]
+    pub bypass_dns_servers: Vec<String>,
+    /// Optional custom country-IP database (file name inside the profile
+    /// directory). Format: `{"IR": ["1.2.3.0/24", ...]}`. Overrides the
+    /// compiled-in builtin ranges for the listed countries.
+    #[serde(default)]
+    pub country_ips_file: Option<String>,
     /// Optional TLS SNI override (defaults to the URL host).
     #[serde(default)]
     pub sni_hostname: Option<String>,
@@ -71,6 +86,26 @@ fn default_dns() -> Vec<String> {
     vec!["1.1.1.1".into(), "8.8.8.8".into()]
 }
 
+/// How the client carries traffic.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ConnMode {
+    /// Full-tunnel TUN device (needs Administrator).
+    #[default]
+    Tun,
+    /// Local SOCKS5 proxy on 127.0.0.1 — no admin, per-app routing,
+    /// with direct bypass rules for split tunneling.
+    Proxy,
+}
+
+fn default_proxy_port() -> u16 {
+    1080
+}
+
+fn default_bypass_dns() -> Vec<String> {
+    // Iranian resolvers reachable from the local/normal internet.
+    vec!["178.22.122.100".into(), "185.51.200.2".into()]
+}
+
 fn default_mtu() -> u16 {
     1420
 }
@@ -84,6 +119,10 @@ impl Profile {
         Self {
             slug: slugify(name),
             name: name.to_string(),
+            mode: ConnMode::Tun,
+            proxy_port: default_proxy_port(),
+            bypass_dns_servers: default_bypass_dns(),
+            country_ips_file: None,
             server_address: String::new(),
             sni_hostname: None,
             server_identity_pin: None,
@@ -110,6 +149,15 @@ impl Profile {
 
     pub fn prekey_path(&self) -> PathBuf {
         self.dir().join("prekey-bundle.json")
+    }
+
+    /// Base WebSocket path for SOCKS5 flows (strip a trailing `/tun`).
+    pub fn socks_endpoint(&self) -> String {
+        let addr = self.server_address.trim();
+        match addr.strip_suffix("/tun") {
+            Some(base) => base.to_string(),
+            None => addr.to_string(),
+        }
     }
 
     pub fn has_identity(&self) -> bool {

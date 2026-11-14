@@ -3839,6 +3839,7 @@ dependencies = [
  "rfd",
  "rvpn-core",
  "rvpn-mobile",
+ "rvpn-tls",
  "serde",
  "serde_json",
  "tempfile",

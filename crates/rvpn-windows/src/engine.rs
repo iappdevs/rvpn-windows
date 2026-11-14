@@ -123,6 +123,15 @@ struct Teardown {
     watcher: Option<tokio::task::JoinHandle<()>>,
     device: Option<Arc<TunDevice>>,
     routes: RouteState,
+    /// Proxy-mode state (mutually exclusive with the TUN fields).
+    proxy: Option<ProxyTeardown>,
+}
+
+/// Running pieces of proxy mode to unwind on stop.
+struct ProxyTeardown {
+    socks: rvpn_mobile::socks5_server::Socks5ServerHandle,
+    flow_task: tokio::task::AbortHandle,
+    udp_task: tokio::task::AbortHandle,
 }
 
 impl Default for Teardown {
@@ -134,6 +143,7 @@ impl Default for Teardown {
             watcher: None,
             device: None,
             routes: RouteState::default(),
+            proxy: None,
         }
     }
 }
@@ -160,7 +170,11 @@ impl EngineHandle {
             }),
         };
 
-        match handle.run_connect(profile) {
+        let result = match profile.mode {
+            crate::profile::ConnMode::Tun => handle.run_connect(profile),
+            crate::profile::ConnMode::Proxy => handle.run_connect_proxy(profile),
+        };
+        match result {
             Ok(()) => {}
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "connect sequence failed");
@@ -170,6 +184,247 @@ impl EngineHandle {
             }
         }
         handle
+    }
+
+    /// SOCKS5 proxy mode: a local 127.0.0.1 listener with split-tunnel rules —
+    /// bypassed hosts (Iranian domains/IPs) go straight over the normal
+    /// internet, everything else rides per-flow encrypted WebSockets to the
+    /// server. No TUN adapter, no routes, no Administrator rights.
+    fn run_connect_proxy(&self, profile: &Profile) -> Result<()> {
+        use rvpn_mobile::flow_connector::FlowConnectorConfig;
+        use rvpn_mobile::socks5_server::{
+            DnsConfig, Socks5Server, Socks5ServerConfig, TunnelRequest,
+        };
+
+        profile.validate().context("profile is not ready")?;
+
+        // TOFU: the pin is computed from the bundle, so we can enforce the
+        // stored pin BEFORE any connection attempt.
+        let bundle_text = std::fs::read_to_string(profile.prekey_path())
+            .context("failed to read the prekey bundle")?;
+        let actual_pin = crate::identity::validate_prekey_text(&bundle_text)?;
+        if let Some(expected) = &profile.server_identity_pin {
+            if expected != &actual_pin {
+                send_event(EngineEvent::TofuMismatch {
+                    slug: profile.slug.clone(),
+                    expected: expected.clone(),
+                    actual: actual_pin,
+                });
+                anyhow::bail!("server identity mismatch — pin stored in the profile differs from the bundle");
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("rvpn-proxy")
+            .build()
+            .context("failed to create the proxy runtime")?;
+
+        let identity =
+            rvpn_core::crypto::IdentityKey::load(&profile.identity_path()).context("identity")?;
+        let bundle: rvpn_core::crypto::X3DHPublicBundle =
+            serde_json::from_str(&bundle_text).context("invalid prekey bundle")?;
+
+        // Split-tunnel rules: bypass countries + inline CIDRs + the profile's
+        // bypass domains (written to a rules file — the SOCKS5 frontend takes
+        // domain lists from files) + optional custom country IP database.
+        let dir = profile.dir();
+        let bypass_domains_file = if profile.bypass_domains.is_empty() {
+            None
+        } else {
+            let path = dir.join("bypass-domains.txt");
+            std::fs::write(&path, profile.bypass_domains.join("\n"))
+                .context("failed to write the bypass-domains file")?;
+            Some(path)
+        };
+        let country_ips_file = profile
+            .country_ips_file
+            .as_ref()
+            .map(|name| dir.join(name))
+            .filter(|p| p.is_file());
+
+        let split = rvpn_mobile::rvpn_split_tunnel::SplitTunnelConfig {
+            enabled: true,
+            builtin_bypass_countries: profile.builtin_bypass_countries.clone(),
+            bypass_networks: profile.bypass_networks.clone(),
+            bypass_domains_file,
+            block_ads: profile.block_ads,
+            country_ips_file,
+            ..Default::default()
+        };
+
+        let listen: std::net::SocketAddr = format!("127.0.0.1:{}", profile.proxy_port)
+            .parse()
+            .context("invalid proxy port")?;
+
+        let dns = DnsConfig {
+            tunnel_dns: profile.dns_servers.clone(),
+            bypass_dns: profile.bypass_dns_servers.clone(),
+        };
+
+        // Parse the server endpoint into (host, port, base path).
+        let endpoint = profile.socks_endpoint();
+        let (host_port, path) = endpoint
+            .strip_prefix("wss://")
+            .or_else(|| endpoint.strip_prefix("ws://"))
+            .unwrap_or(&endpoint)
+            .split_once('/')
+            .map(|(hp, p)| (hp.to_string(), format!("/{p}")))
+            .unwrap_or((endpoint.clone(), "/api/v1/ws".to_string()));
+        let (server_host, server_port) = host_port
+            .rsplit_once(':')
+            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(443)))
+            .unwrap_or((host_port.clone(), 443));
+
+        let socks_config = Socks5ServerConfig {
+            listen_addr: listen,
+            split_tunnel: Some(split),
+            dns_config: Some(dns),
+            direct_bypass: true,
+        };
+
+        self.set_phase(EnginePhase::Connecting { detail: "starting proxy".into() });
+        let server = runtime
+            .block_on(Socks5Server::new(socks_config))
+            .context("failed to initialize the SOCKS5 frontend")?;
+
+        let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<TunnelRequest>(256);
+        let (_udp_tx, mut udp_rx) =
+            tokio::sync::mpsc::channel::<rvpn_mobile::socks5_server::UdpAssociationRequest>(16);
+
+        let handle = runtime
+            .block_on(server.run_with_shutdown(tun_tx, _udp_tx))
+            .context("failed to bind the SOCKS5 listener")?;
+        let local_addr = handle.local_addr;
+
+        // TCP flows → per-flow encrypted WebSocket to the server.
+        let flow_config = FlowConnectorConfig {
+            server_host,
+            server_port,
+            server_path: path,
+            tls_fingerprint: rvpn_tls::TlsFingerprint::Chrome,
+            identity_key: Arc::new(identity),
+            server_bundle: bundle,
+            resumption: None,
+        };
+
+        let stop = self.inner.stop_flag.clone();
+        let rx_bytes = self.inner.rx_bytes.clone();
+        let tx_bytes = self.inner.tx_bytes.clone();
+        let mut flow_task = {
+            let flow_config = flow_config.clone();
+            runtime.spawn(async move {
+                while let Some(req) = tun_rx.recv().await {
+                    let cfg = flow_config.clone();
+                    let rx = rx_bytes.clone();
+                    let tx = tx_bytes.clone();
+                    tokio::spawn(async move {
+                        let mut socket = req.socket;
+                        let mut addr = req.target_address.clone();
+                        // strip a possible trailing port split for host parse
+                        let (host, port) = match addr.rsplit_once(':') {
+                            Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(80)),
+                            None => (addr.clone(), 80),
+                        };
+                        if host.contains(':') && host.starts_with('[') {
+                            // IPv6 literal [::1]:443 — keep whole as host
+                            addr = addr.trim_start_matches('[').to_string();
+                        }
+                        let counters = {
+                            let rx = rx.clone();
+                            let tx = tx.clone();
+                            move |up: u64, down: u64| {
+                                tx.store(up, Ordering::Relaxed);
+                                rx.store(down, Ordering::Relaxed);
+                            }
+                        };
+                        let result = rvpn_mobile::flow_connector::relay_flow(
+                            &cfg,
+                            &host,
+                            port,
+                            &mut socket,
+                            &counters,
+                        )
+                        .await;
+                        if let Err(e) = &result {
+                            tracing::debug!(error = %format!("{e:#}"), "flow ended with error");
+                        }
+                        let _ = req.completion_sender.send(result.map(|_| ())).await;
+                    });
+                }
+            })
+        };
+
+        // UDP ASSOCIATE is not carried in proxy mode (browsers are fine with
+        // TCP-only SOCKS5 + remote DNS); answer immediately so clients retry.
+        let udp_task = runtime.spawn(async move {
+            while let Some(req) = udp_rx.recv().await {
+                let _ = req
+                    .completion_sender
+                    .send(Err(anyhow::anyhow!("UDP associate not supported in proxy mode")))
+                    .await;
+            }
+        });
+
+        // Readiness probe: a SOCKS5 CONNECT through our own listener to a
+        // harmless target proves TLS + X3DH + relay end-to-end before we
+        // report Connected.
+        self.set_phase(EnginePhase::Connecting { detail: "handshaking".into() });
+        let probe = runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok(mut s) = tokio::net::TcpStream::connect(local_addr).await else {
+                return false;
+            };
+            if s.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
+                return false;
+            }
+            let mut b = [0u8; 2];
+            if s.read_exact(&mut b).await.is_err() || b[0] != 0x05 {
+                return false;
+            }
+            // CONNECT example.com:80 (domain-name address type)
+            let host = b"example.com";
+            let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+            req.extend_from_slice(host);
+            req.extend_from_slice(&80u16.to_be_bytes());
+            if s.write_all(&req).await.is_err() {
+                return false;
+            }
+            let mut resp = [0u8; 10];
+            s.read_exact(&mut resp).await.is_ok() && resp[1] == 0x00
+        });
+        if !probe {
+            anyhow::bail!("proxy self-test failed — could not open a test flow through the server");
+        }
+
+        // Persist the running pieces for teardown.
+        *self.inner.connected_at.lock().unwrap() = Some(Instant::now());
+        let mut teardown = Teardown::default();
+        teardown.runtime = Some(runtime);
+        teardown.proxy = Some(ProxyTeardown {
+            socks: handle,
+            flow_task: flow_task.abort_handle(),
+            udp_task: udp_task.abort_handle(),
+        });
+        *self.inner.teardown.lock().unwrap() = Some(teardown);
+
+        if profile.server_identity_pin.is_none() {
+            send_event(EngineEvent::TofuCaptured {
+                slug: profile.slug.clone(),
+                pin: actual_pin,
+            });
+        }
+
+        self.set_phase(EnginePhase::Connected {
+            ip: format!("socks5://{local_addr}"),
+            gateway: "bypass rules active".into(),
+            server: profile.server_address.clone(),
+        });
+        send_event(EngineEvent::Notice(format!(
+            "SOCKS5 proxy on {local_addr} — set your browser/apps to it (bypass rules applied)"
+        )));
+        Ok(())
     }
 
     fn set_phase(&self, phase: EnginePhase) {
@@ -537,6 +792,19 @@ fn teardown_inner(inner: &EngineInner) {
     };
 
     tracing::info!("tearing the tunnel down");
+
+    // Proxy mode: stop the SOCKS5 listener and the flow pump, then the
+    // runtime drops below. Nothing OS-level to undo.
+    if let Some(proxy) = t.proxy.take() {
+        if let Some(rt) = t.runtime.as_ref() {
+            rt.block_on(proxy.socks.stop());
+        }
+        proxy.flow_task.abort();
+        proxy.udp_task.abort();
+        t.runtime = None;
+        tracing::info!("proxy mode teardown complete");
+        return;
+    }
 
     // Unblock the uplink pump's parked receive first, then join both pumps.
     if let Some(dev) = t.device.as_ref() {

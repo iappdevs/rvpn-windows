@@ -15,6 +15,7 @@ path = "src/main.rs"
 # --- rVPN engine (vendored upstream crates — see PATCHES.md) ---
 rvpn-mobile = { path = "../../../rVPN-core/rvpn/crates/rvpn-mobile", default-features = false, features = ["windows-direct-tun"] }
 rvpn-core = { path = "../../../rVPN-core/rvpn/crates/rvpn-core" }
+rvpn-tls = { path = "../../../rVPN-core/rvpn/crates/rvpn-tls", default-features = false, features = ["rustls"] }
 
 # --- async runtime (mirrors the engine's tokio version constraints) ---
 tokio = { version = "1.35", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
