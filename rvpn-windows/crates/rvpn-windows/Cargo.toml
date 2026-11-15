@@ -1,0 +1,75 @@
+[package]
+name = "rvpn-windows"
+description = "R-VPN client for Windows — full-tunnel VPN over Wintun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rvpn-windows"
+path = "src/main.rs"
+
+[dependencies]
+# --- rVPN engine (vendored upstream crates — see PATCHES.md) ---
+rvpn-mobile = { path = "../../../rVPN-core/rvpn/crates/rvpn-mobile", default-features = false, features = ["windows-direct-tun"] }
+rvpn-core = { path = "../../../rVPN-core/rvpn/crates/rvpn-core" }
+rvpn-tls = { path = "../../../rVPN-core/rvpn/crates/rvpn-tls", default-features = false, features = ["rustls"] }
+
+# --- async runtime (mirrors the engine's tokio version constraints) ---
+tokio = { version = "1.35", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+
+# --- GUI ---
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = { version = "0.31" }
+tray-icon = "0.19"
+rfd = "0.15"
+
+# --- Windows platform ---
+wintun = "0.5"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Networking_WinInet",
+] }
+winreg = "0.52"
+
+# --- utilities ---
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+regex = "1"
+ip_network = "0.4"
+ip_network_table = "0.2"
+httparse = "1"
+hickory-proto = "0.24"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
+sha2 = "0.10"
+tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
+
+[build-dependencies]
+winres = "0.1"
+
+[features]
+# Embed the requireAdministrator manifest (default for shipped builds).
+# Tests opt out: `cargo test --release --no-default-features`.
+default = ["admin-manifest"]
+admin-manifest = []
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[package.metadata.winres]
+FileDescription = "R-VPN Client for Windows"
+ProductName = "rvpn-windows"
+LegalCopyright = "Copyright (C) 2026. AGPL-3.0-or-later"

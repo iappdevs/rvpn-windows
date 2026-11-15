@@ -1,0 +1,96 @@
+From 0d96729b562ba3d4236408c653422e651ee71d91 Mon Sep 17 00:00:00 2001
+From: Amir <gilaniamirhossein@gmail.com>
+Date: Sat, 14 Nov 2026 18:05:26 +0330
+Subject: [PATCH 5/6] socks5_server: accept SOCKS4/4a (the dialect WinINET
+ speaks)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Windows' system proxy, when configured with ProxyServer=socks=host:port,
+connects using SOCKS4 — the frontend rejected it outright. The handshake
+now understands SOCKS4 and 4a (domain-after-userid), replies 0x5A/0x5B,
+and funnels the target into the same split-tunnel decision path as
+SOCKS5.
+---
+ rvpn/crates/rvpn-mobile/src/socks5_server.rs | 64 ++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/rvpn/crates/rvpn-mobile/src/socks5_server.rs b/rvpn/crates/rvpn-mobile/src/socks5_server.rs
+index c390ff3..f894aa4 100644
+--- a/rvpn/crates/rvpn-mobile/src/socks5_server.rs
++++ b/rvpn/crates/rvpn-mobile/src/socks5_server.rs
+@@ -720,6 +720,70 @@ async fn socks5_handshake(
+     socket.read_exact(&mut greeting).await
+         .map_err(|e| anyhow::anyhow!("Failed to read greeting: {}", e))?;
+     
++    if greeting[0] == 0x04 {
++        // SOCKS4/4a handshake (e.g. Windows WinINET configured with "socks=host:port")
++        // Greeting bytes: [VER=0x04][CMD]
++        if greeting[1] != 0x01 {
++            // Only CONNECT is supported
++            socket.write_all(&[0x00, 0x5B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
++            return Err(anyhow::anyhow!("SOCKS4: only CONNECT supported"));
++        }
++
++        // Read DSTPORT (2 bytes, big-endian) then DSTIP (4 bytes)
++        let mut rest = [0u8; 6];
++        socket.read_exact(&mut rest).await
++            .map_err(|e| anyhow::anyhow!("SOCKS4: failed to read port/IP: {}", e))?;
++        let port = u16::from_be_bytes([rest[0], rest[1]]);
++        let dst_ip = [rest[2], rest[3], rest[4], rest[5]];
++
++        // Read USERID until NUL terminator (bounded)
++        let mut userid = Vec::new();
++        loop {
++            let mut b = [0u8; 1];
++            socket.read_exact(&mut b).await
++                .map_err(|e| anyhow::anyhow!("SOCKS4: failed to read userid: {}", e))?;
++            if b[0] == 0x00 {
++                break;
++            }
++            userid.push(b[0]);
++            if userid.len() >= 256 {
++                return Err(anyhow::anyhow!("SOCKS4: userid too long"));
++            }
++        }
++
++        // SOCKS4a: DSTIP of the form 0.0.0.x (x != 0) means the domain follows the userid
++        let is_socks4a = dst_ip[0] == 0 && dst_ip[1] == 0 && dst_ip[2] == 0 && dst_ip[3] != 0;
++        let host = if is_socks4a {
++            let mut domain = Vec::new();
++            loop {
++                let mut b = [0u8; 1];
++                socket.read_exact(&mut b).await
++                    .map_err(|e| anyhow::anyhow!("SOCKS4a: failed to read domain: {}", e))?;
++                if b[0] == 0x00 {
++                    break;
++                }
++                domain.push(b[0]);
++                if domain.len() >= 256 {
++                    return Err(anyhow::anyhow!("SOCKS4a: domain too long"));
++                }
++            }
++            String::from_utf8_lossy(&domain).to_string()
++        } else {
++            Ipv4Addr::from(dst_ip).to_string()
++        };
++
++        // Send success reply: [0x00][0x5A][DSTPORT BE][DSTIP] (0.0.0.0 for 4a domains)
++        let reply_ip: [u8; 4] = if is_socks4a { [0, 0, 0, 0] } else { dst_ip };
++        socket.write_all(&[0x00, 0x5A, rest[0], rest[1], reply_ip[0], reply_ip[1], reply_ip[2], reply_ip[3]]).await
++            .map_err(|e| anyhow::anyhow!("SOCKS4: failed to send reply: {}", e))?;
++        socket.flush().await
++            .map_err(|e| anyhow::anyhow!("SOCKS4: failed to flush reply: {}", e))?;
++
++        info!("[SOCKS5] SOCKS4/4a CONNECT {}:{}", host, port);
++
++        return Ok(Some(format!("{}:{}", host, port)));
++    }
++
+     if greeting[0] != 0x05 {
+         return Err(anyhow::anyhow!("Unsupported SOCKS version: {}", greeting[0]));
+     }
+-- 
+2.51.0.windows.1
+

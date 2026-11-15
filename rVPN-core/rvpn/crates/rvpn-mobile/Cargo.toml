@@ -1,0 +1,168 @@
+[package]
+name = "rvpn-mobile"
+# Pinned separately from the workspace. Bump this in lockstep with the mobile
+# app releases (iOS/macOS/Android), not with the CLI/server workspace version.
+version = "1.2.10"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+description = "R-VPN mobile FFI bindings"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+# Async runtime — multi_thread required (current_thread doesn't drive spawn() tasks)
+tokio = { version = "1.35", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Custom allocator — aggressive page purging for iOS 50MB jetsam limit.
+# Gated behind the `mimalloc` feature so the system allocator can be used
+# for diagnostics (e.g. confirming mimalloc's VM arena reservation is the
+# source of the `internal` growth seen in memlog).
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+# Core
+rvpn-core = { path = "../rvpn-core" }
+# TLS backend is selected by the *direct-tun feature in use:
+#   ios-direct-tun   → rvpn-tls/rustls  (BoringSSL's SSL_read leaks anonymous VM in the iOS NE sandbox)
+#   macos-direct-tun → rvpn-tls/boring  (keeps Chrome ClientHello mimicry on desktop)
+#   android-direct-tun → rustls inline in android_server_session.rs for the transport, but
+#     rvpn-tls/rustls is enabled so the shared ResumptionStore type (rustls side) is available
+#     for per-exit TLS session resumption. All of rvpn-tls's rustls deps (rustls, tokio-rustls,
+#     webpki-roots) are already in the Android dep graph, so this adds no new dependencies.
+rvpn-tls = { path = "../rvpn-tls", default-features = false }
+futures = "0.3"
+futures-util = "0.3"
+
+# WebSocket
+# WebSocket (iOS uses BoringSSL for TLS, not rustls)
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
+tungstenite = "0.21"
+
+# TLS - rustls only needed for Android (iOS uses BoringSSL)
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# Serialization for JSON config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Binary serialization
+bincode = "1.3"
+
+# Logging
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
+
+# State management
+once_cell = "1.19"
+parking_lot = "0.12"
+
+# C types
+libc = "0.2"
+
+# Base64 encoding
+base64.workspace = true
+
+# Curve conversion
+curve25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Utilities
+bytes.workspace = true
+rand.workspace = true
+
+# Socket options for SO_REUSEADDR
+socket2 = "0.5"
+
+# IP network handling for split tunnel
+ipnetwork = "0.20"
+
+# Concurrent hashmap for flow creation locks
+dashmap = "5.5"
+
+# DNS server and client
+hickory-proto = { version = "0.24", optional = true }
+
+# R-VPN split tunnel — iOS disables builtin data (50MB jetsam), Android keeps it
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel", default-features = false }
+
+# iOS-specific dependencies
+[target.'cfg(target_os = "ios")'.dependencies]
+# Optional: Use tracing-oslog for iOS device logging (requires iOS SDK)
+# Enable with --features ios-logging when building for device
+tracing-oslog = { version = "0.2", optional = true }
+
+# macOS-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS keeps builtin IPs/domains (no 50MB NetworkExtension jetsam limit)
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
+
+# Windows-specific dependencies
+# Windows keeps builtin IPs/domains (bypass-country split tunnel data,
+# used by the rvpn-windows desktop client's route setup).
+[target.'cfg(target_os = "windows")'.dependencies]
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
+
+# Android-specific dependencies
+[target.'cfg(target_os = "android")'.dependencies]
+# Android keeps builtin IPs/domains (no 50MB jetsam limit)
+rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
+# Android logging via logcat
+android_log = "0.1"
+# Bridge tracing to log crate for Android logcat output
+tracing-log = "0.2"
+# JNI for proper string handling
+jni = "0.21"
+jni-sys = "0.3"
+
+[features]
+# Enable iOS logging via os_log (device only, not simulator)
+ios-logging = ["tracing-oslog"]
+# Enable DNS server support
+dns = ["hickory-proto"]
+# Enable iOS Direct TUN mode (uses ios_tun_ffi instead of legacy TunBridge).
+# Selects the rustls TLS backend — native-tls (Security.framework) cannot
+# negotiate TLS 1.3 correctly on iOS. rustls handles TLS 1.3 reliably and
+# has no memory leak (unlike BoringSSL).
+ios-direct-tun = ["rvpn-tls/rustls"]
+# Enable macOS Direct TUN mode (uses same ios_tun implementation as iOS).
+# Selects the boring TLS backend to retain Chrome ClientHello fingerprint mimicry.
+macos-direct-tun = ["rvpn-tls/boring"]
+# Enable Windows Direct TUN mode (uses same ios_tun implementation as iOS).
+# Selects the rustls TLS backend — same stack as the iOS production builds;
+# boring (BoringSSL) would require cmake/nasm to build on Windows MSVC and is
+# not needed for protocol correctness (the protocol requires TLS 1.3 only).
+windows-direct-tun = ["dns", "rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls", "rvpn-tls/rustls"]
+# Enable Android Direct TUN mode (uses android_tun_ffi instead of legacy TunBridge)
+android-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls", "rvpn-tls/rustls"]
+# Enable HarmonyOS NEXT NAPI FFI (uses rustls, same TLS stack as Android).
+# Consumed by the DevEco project at `rvpn-harmonyos/`.
+harmony-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls"]
+# Enable on-device memory diagnostics (memlog CSV, malloc zone stats,
+# mimalloc FFI). Not needed for production builds.
+diagnostics = []
+default = ["dns", "mimalloc"]
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# SOCKS5 proxy - disable on mobile as we handle it differently
+# fast-socks5 = "0.8"
+
+[dev-dependencies]
+# fmt layer for examples (e.g. reconnect_soak) — never linked into the
+# shipped staticlib/cdylib.
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

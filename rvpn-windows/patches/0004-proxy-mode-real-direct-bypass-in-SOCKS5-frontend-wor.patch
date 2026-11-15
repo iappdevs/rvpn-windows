@@ -1,0 +1,423 @@
+From 290c0cd93cba1efcccbab585816786185539aad2 Mon Sep 17 00:00:00 2001
+From: Amir <gilaniamirhossein@gmail.com>
+Date: Sat, 14 Nov 2026 17:08:48 +0330
+Subject: [PATCH 4/6] proxy mode: real direct-bypass in SOCKS5 frontend +
+ working per-flow relay
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- socks5_server (was dead code, now declared): Socks5ServerConfig gains
+  direct_bypass — Bypass flows (IP rule, domain rule, or bypass-DNS
+  query) are relayed by the frontend itself over the normal internet
+  instead of answering SOCKS error 0x02 (which only iOS retries).
+  Domain-name targets are now also matched against the bypass rules
+  (previously only IP literals were decided).
+- flow_connector: perform_handshake/send_target_address made public and
+  fixed — target frames must be binary RatchetMessage (not JSON) and
+  1KB-padded (the server unpads before parsing); both bugs made the very
+  first post-handshake message fail. New relay_flow() provides the
+  complete per-flow path (TLS+WS+X3DH+target+bidirectional copy) for
+  self-contained SOCKS5 hosts.
+---
+ rvpn/crates/rvpn-mobile/src/flow_connector.rs | 148 +++++++++++++++++-
+ rvpn/crates/rvpn-mobile/src/lib.rs            |   3 +
+ rvpn/crates/rvpn-mobile/src/socks5_server.rs  |  97 ++++++++++--
+ 3 files changed, 234 insertions(+), 14 deletions(-)
+
+diff --git a/rvpn/crates/rvpn-mobile/src/flow_connector.rs b/rvpn/crates/rvpn-mobile/src/flow_connector.rs
+index 507438e..608764e 100644
+--- a/rvpn/crates/rvpn-mobile/src/flow_connector.rs
++++ b/rvpn/crates/rvpn-mobile/src/flow_connector.rs
+@@ -195,7 +195,7 @@ pub async fn create_flow_connection(
+ }
+ 
+ /// Perform X3DH handshake with server
+-async fn perform_handshake(
++pub async fn perform_handshake(
+     ws_reader: &mut WsStream,
+     ws_writer: &mut WsSink,
+     identity_key: &std::sync::Arc<IdentityKey>,
+@@ -311,7 +311,7 @@ async fn perform_handshake(
+ }
+ 
+ /// Send target address to server
+-async fn send_target_address(
++pub async fn send_target_address(
+     ws_writer: &mut WsSink,
+     ratchet: &mut DoubleRatchet,
+     target_host: &str,
+@@ -328,12 +328,19 @@ async fn send_target_address(
+     target_data.extend_from_slice(host_bytes);
+     target_data.extend_from_slice(&target_port.to_be_bytes());
+ 
++    // Pad to the 1 KB boundary like every other data frame — the server
++    // unpads the first frame before parsing the target.
++    let padded_target = rvpn_core::protocol::padding::pad_packet(&target_data)
++        .context("Failed to pad target address")?;
++
+     // Encrypt with payload type 0x01 (Data)
+-    let message = ratchet.encrypt(&target_data, &[0x01])
++    let message = ratchet.encrypt(&padded_target, &[0x01])
+         .context("Failed to encrypt target address")?;
+ 
+-    // Serialize to JSON
+-    let serialized = serde_json::to_vec(&message)
++    // Serialize to the binary RatchetMessage framing the server expects for
++    // the data path (the JSON framing here made the server reject the very
++    // first post-handshake message with "enum tag 123").
++    let serialized = message.to_bytes()
+         .context("Failed to serialize RatchetMessage")?;
+ 
+     // Send as binary
+@@ -355,3 +362,134 @@ fn rand_id() -> u64 {
+     let rand: u64 = rng.gen();
+     now.wrapping_add(rand)
+ }
++
++/// Relay one TCP flow end-to-end: TLS + WebSocket + X3DH + target address,
++/// then bidirectional copy between `socket` and the encrypted flow.
++///
++/// This is the complete Brook-style per-flow path for hosts that run the
++/// SOCKS5 frontend themselves (the Windows client's proxy mode). It mirrors
++/// the CLI's `stream_relay`: 1 KB-boundary padding, payload type 0x01,
++/// binary RatchetMessage framing on the data path and JSON framing for the
++/// target-address message.
++///
++/// `on_bytes(up, down)` is invoked after each chunk for stats accounting.
++pub async fn relay_flow<S>(
++    config: &FlowConnectorConfig,
++    target_host: &str,
++    target_port: u16,
++    socket: &mut S,
++    on_bytes: &(dyn Fn(u64, u64) + Send + Sync),
++) -> Result<()>
++where
++    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
++{
++    use rvpn_core::crypto::ratchet::RatchetMessage;
++    use rvpn_core::protocol::padding::{pad_packet, unpad_packet};
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++    let flow_id = rand_id();
++    let url = format!("wss://{}:{}{}", config.server_host, config.server_port, config.server_path);
++    info!(
++        "[FlowConnector] relay_flow {}:{} (flow {flow_id}) via {}",
++        target_host, target_port, url
++    );
++
++    // TLS + WebSocket upgrade (rustls on iOS/Windows, boring elsewhere).
++    #[cfg(feature = "android-direct-tun")]
++    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(&url, None, false, None)
++        .await
++        .context("FlowConnector connection failed")?;
++
++    #[cfg(not(feature = "android-direct-tun"))]
++    let (ws_stream, _) = {
++        let tls_stream = {
++            #[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
++            let s = rvpn_tls::connect_rustls_with_store(
++                &config.server_host,
++                config.server_port,
++                Some(&config.server_host),
++                config.resumption.as_ref(),
++            )
++            .await
++            .context("TLS handshake failed")?;
++            #[cfg(not(any(feature = "ios-direct-tun", feature = "windows-direct-tun")))]
++            let s = rvpn_tls::connect_chrome_like(
++                &config.server_host,
++                config.server_port,
++                rvpn_tls::TlsFingerprint::Chrome,
++                Some(&config.server_host),
++            )
++            .await
++            .context("TLS handshake failed")?;
++            s
++        };
++        tokio_tungstenite::client_async(&url, tls_stream)
++            .await
++            .context("FlowConnector WebSocket handshake failed")?
++    };
++
++    let (mut ws_write, mut ws_read) = ws_stream.split();
++
++    // X3DH + Double Ratchet.
++    let mut ratchet = perform_handshake(&mut ws_read, &mut ws_write, &config.identity_key, &config.server_bundle)
++        .await
++        .context("X3DH handshake failed")?;
++
++    // Introduce the target to the server: [host_len][host][port BE], padded,
++    // binary RatchetMessage framing (the V1 per-flow path on this endpoint).
++    send_target_address(&mut ws_write, &mut ratchet, target_host, target_port)
++        .await
++        .context("Failed to send target address")?;
++
++    info!("[FlowConnector] flow {flow_id} relaying");
++
++    // Bidirectional copy: after the target message the data path is raw
++    // payloads (1 KB-boundary padded, Data AAD) — one flow per connection.
++    let mut buf = vec![0u8; 16 * 1024];
++    let mut up: u64 = 0;
++    let mut down: u64 = 0;
++    loop {
++        tokio::select! {
++            readable = socket.read(&mut buf) => {
++                let n = readable.context("local socket read failed")?;
++                if n == 0 {
++                    break; // local side closed
++                }
++                up += n as u64;
++                on_bytes(up, down);
++                let padded = pad_packet(&buf[..n]).context("padding failed")?;
++                let message = ratchet
++                    .encrypt(&padded, &[0x01])
++                    .map_err(|e| anyhow::anyhow!("encrypt failed: {e:?}"))?;
++                let bytes = message.to_bytes().context("serialize failed")?;
++                ws_write.send(Message::Binary(bytes)).await.context("ws send failed")?;
++            }
++            frame = ws_read.next() => {
++                let Some(frame) = frame else { break }; // server closed
++                let msg = frame.context("ws read failed")?;
++                let data = match msg {
++                    Message::Binary(d) => d,
++                    Message::Close(_) => break,
++                    _ => continue,
++                };
++                let message = RatchetMessage::from_bytes(&data).context("bad RatchetMessage")?;
++                // AAD must match the payload type the server encrypted with.
++                let aad = [message.header.payload_type];
++                let decrypted = ratchet
++                    .decrypt(&message, &aad)
++                    .map_err(|e| anyhow::anyhow!("decrypt failed: {e:?}"))?;
++                let plaintext = unpad_packet(&decrypted).context("unpad failed")?;
++                if plaintext.is_empty() {
++                    continue;
++                }
++                down += plaintext.len() as u64;
++                on_bytes(up, down);
++                socket.write_all(&plaintext).await.context("local write failed")?;
++            }
++        }
++    }
++
++    info!("[FlowConnector] flow {flow_id} ended (up {up} B, down {down} B)");
++    let _ = ws_write.send(Message::Close(None)).await;
++    Ok(())
++}
+diff --git a/rvpn/crates/rvpn-mobile/src/lib.rs b/rvpn/crates/rvpn-mobile/src/lib.rs
+index 819da22..42222d9 100644
+--- a/rvpn/crates/rvpn-mobile/src/lib.rs
++++ b/rvpn/crates/rvpn-mobile/src/lib.rs
+@@ -35,6 +35,9 @@ pub mod route_map;
+ #[cfg(any(feature = "android-direct-tun", feature = "dns"))]
+ pub mod flow_connector;
+ pub mod ws;
++// In-process SOCKS5 frontend with split-tunnel rules (host apps wire the
++// tunnel side via TunnelRequest channels; see flow_connector::relay_flow).
++pub mod socks5_server;
+ 
+ // iOS Direct TUN mode - implementation using IosTunClient
+ // (also compiled on Windows by the rvpn-windows desktop client via the
+diff --git a/rvpn/crates/rvpn-mobile/src/socks5_server.rs b/rvpn/crates/rvpn-mobile/src/socks5_server.rs
+index 57891cc..c390ff3 100644
+--- a/rvpn/crates/rvpn-mobile/src/socks5_server.rs
++++ b/rvpn/crates/rvpn-mobile/src/socks5_server.rs
+@@ -271,6 +271,21 @@ pub struct Socks5ServerConfig {
+     pub split_tunnel: Option<rvpn_split_tunnel::SplitTunnelConfig>,
+     /// DNS server configuration for split tunnel routing
+     pub dns_config: Option<DnsConfig>,
++    /// When true, Bypass flows are relayed by this server directly over the
++    /// normal internet. When false (iOS legacy), bypass flows answer with a
++    /// SOCKS5 ruleset error (0x02) so the OS retries them outside the VPN.
++    pub direct_bypass: bool,
++}
++
++impl Default for Socks5ServerConfig {
++    fn default() -> Self {
++        Self {
++            listen_addr: "127.0.0.1:1080".parse().unwrap(),
++            split_tunnel: None,
++            dns_config: None,
++            direct_bypass: false,
++        }
++    }
+ }
+ 
+ /// SOCKS5 server that handles connections and forwards to tunnel
+@@ -280,6 +295,8 @@ pub struct Socks5Server {
+     split_tunnel: Option<Arc<SplitTunnel>>,
+     /// DNS configuration
+     dns_config: DnsConfig,
++    /// Relay bypassed flows ourselves instead of answering with an error
++    direct_bypass: bool,
+ }
+ 
+ impl Clone for Socks5Server {
+@@ -288,6 +305,7 @@ impl Clone for Socks5Server {
+             listen_addr: self.listen_addr,
+             split_tunnel: self.split_tunnel.clone(),
+             dns_config: self.dns_config.clone(),
++            direct_bypass: self.direct_bypass,
+         }
+     }
+ }
+@@ -357,15 +375,17 @@ impl Socks5Server {
+             listen_addr: config.listen_addr,
+             split_tunnel,
+             dns_config,
++            direct_bypass: config.direct_bypass,
+         })
+     }
+-    
++
+     /// Create a new SOCKS5 server without split tunnel support (legacy)
+     pub fn new_simple(config: Socks5ServerConfig) -> Self {
+         Self {
+             listen_addr: config.listen_addr,
+             split_tunnel: None,
+             dns_config: config.dns_config.unwrap_or_default(),
++            direct_bypass: config.direct_bypass,
+         }
+     }
+ 
+@@ -397,6 +417,7 @@ impl Socks5Server {
+         // Clone server state for the accept loop
+         let split_tunnel = self.split_tunnel.clone();
+         let dns_config = self.dns_config.clone();
++        let direct_bypass = self.direct_bypass;
+ 
+         // Spawn the accept loop
+         tokio::spawn(async move {
+@@ -415,14 +436,16 @@ impl Socks5Server {
+                                 let udp_sender = udp_tunnel_sender.clone();
+                                 let st = split_tunnel.clone();
+                                 let dns = dns_config.clone();
++                                let direct = direct_bypass;
+                                 let handle = tokio::spawn(async move {
+                                     if let Err(e) = handle_socks5_connection(
+-                                        socket, 
+-                                        addr, 
+-                                        tcp_sender, 
++                                        socket,
++                                        addr,
++                                        tcp_sender,
+                                         udp_sender,
+                                         st,
+                                         dns,
++                                        direct,
+                                     ).await {
+                                         error!("SOCKS5 connection error from {}: {}", addr, e);
+                                     }
+@@ -478,6 +501,7 @@ async fn handle_socks5_connection(
+     udp_tunnel_sender: mpsc::Sender<UdpAssociationRequest>,
+     split_tunnel: Option<Arc<SplitTunnel>>,
+     dns_config: DnsConfig,
++    direct_bypass: bool,
+ ) -> Result<()> {
+     info!("[SOCKS5] New connection from {}", addr);
+ 
+@@ -511,13 +535,19 @@ async fn handle_socks5_connection(
+             // For domain names, we can't do IP-based bypass without resolving first
+             if let Ok(target_ip) = target_host.parse::<std::net::IpAddr>() {
+                 let routing = split_tunnel.decide_by_ip(target_ip).await;
+-                
++
+                 match routing {
+                     RoutingDecision::Bypass => {
+                         info!(
+-                            "[SOCKS5] Connection to {}:{} bypassing VPN (IP in bypass networks)", 
++                            "[SOCKS5] Connection to {}:{} bypassing VPN (IP in bypass networks)",
+                             target_host, target_port
+                         );
++                        if direct_bypass {
++                            // Self-contained hosts (Windows/desktop): relay the
++                            // flow ourselves over the normal internet.
++                            send_socks5_success(&mut socket).await?;
++                            return direct_relay(&mut socket, &target_addr).await;
++                        }
+                         // Send SOCKS5 error: Connection not allowed by ruleset (0x02)
+                         // This signals to iOS that it should retry with direct connection
+                         send_socks5_error(&mut socket, 0x02).await?;
+@@ -542,22 +572,57 @@ async fn handle_socks5_connection(
+         }
+     }
+     
++    // 3b. Domain-based bypass routing for non-DNS connections.
++    // IP-literal targets were decided above; a hostname can be matched
++    // directly against the bypass-domain rules (suffix/*. patterns) without
++    // resolving it first.
++    if target_port != 53 && direct_bypass {
++        if let Some(ref split_tunnel) = split_tunnel {
++            if target_host.parse::<std::net::IpAddr>().is_err() && !target_host.is_empty() {
++                let routing = split_tunnel.decide_by_host(&target_host).await;
++                match routing {
++                    RoutingDecision::Bypass => {
++                        info!(
++                            "[SOCKS5] Connection to {}:{} bypassing VPN (domain rule)",
++                            target_host, target_port
++                        );
++                        send_socks5_success(&mut socket).await?;
++                        return direct_relay(&mut socket, &target_addr).await;
++                    }
++                    RoutingDecision::Block => {
++                        warn!("[SOCKS5] Connection to {}:{} blocked (domain rule)", target_host, target_port);
++                        send_socks5_error(&mut socket, 0x02).await?;
++                        return Ok(());
++                    }
++                    RoutingDecision::Tunnel => {}
++                }
++            }
++        }
++    }
++
+     // 4. Check if this is a DNS query (port 53) and apply split tunnel routing
+     if target_port == 53 {
+         if let Some(ref split_tunnel) = split_tunnel {
+             // Try to extract domain from DNS query packet
+             let domain = peek_dns_domain(&mut socket).await;
+-            
++
+             let domain_to_check = domain.as_deref().unwrap_or(&target_host);
+-            
++
+             if !domain_to_check.is_empty() {
+                 let routing = split_tunnel.decide_by_host(domain_to_check).await;
+-                
++
+                 match routing {
+                     RoutingDecision::Bypass => {
+                         // Use local DNS server (China)
+                         if let Some(local_dns) = get_next_dns_server(&dns_config.bypass_dns, 0) {
+                             info!("DNS for {} bypassing tunnel (using local DNS: {})", domain_to_check, local_dns);
++                            if direct_bypass {
++                                // Self-contained hosts: query the local resolver
++                                // ourselves over the normal internet.
++                                let dns_addr = format!("{}:53", local_dns);
++                                send_socks5_success(&mut socket).await?;
++                                return direct_relay(&mut socket, &dns_addr).await;
++                            }
+                             target_addr = format!("{}:53", local_dns);
+                         }
+                     }
+@@ -1586,3 +1651,17 @@ mod tests {
+         assert_eq!(parse_dns_query_domain(&packet), Some("www.test.example.com".to_string()));
+     }
+ }
++
++/// Relay a bypassed flow directly over the normal internet.
++///
++/// Used when `Socks5ServerConfig::direct_bypass` is set (self-contained
++/// hosts such as the Windows client's proxy mode): the SOCKS5 frontend
++/// itself connects to the target and pipes bytes, so no OS-level routing
++/// tricks are needed for split-tunnel "direct" traffic.
++async fn direct_relay(socket: &mut TcpStream, target_addr: &str) -> Result<()> {
++    let mut outbound = TcpStream::connect(target_addr)
++        .await
++        .with_context(|| format!("[SOCKS5] direct connect to {target_addr} failed"))?;
++    tokio::io::copy_bidirectional(socket, &mut outbound).await?;
++    Ok(())
++}
+-- 
+2.51.0.windows.1
+

@@ -1,0 +1,293 @@
+From bf9d63a500e097ff18c124e3b2ed50b093c6da53 Mon Sep 17 00:00:00 2001
+From: Amir <gilaniamirhossein@gmail.com>
+Date: Sat, 14 Nov 2026 12:45:09 +0330
+Subject: [PATCH 1/6] windows: add windows-direct-tun feature to rvpn-mobile
+
+- New cargo feature windows-direct-tun: rustls TLS backend (same as iOS
+  production), dns, and the direct-TUN host-agnostic engine modules.
+- Gate Apple-only code (libmalloc zone APIs, Mach task_info RSS reader)
+  behind target_vendor = "apple" with no-op stubs elsewhere.
+- Expose start_dns_proxy_for_direct_tun as pub so host apps (Windows
+  client) can start the loopback DoH DNS proxy natively in-process.
+- Windows target keeps rvpn-split-tunnel builtin data (bypass countries),
+  same as macOS/Android.
+---
+ .gitignore                                    |  2 ++
+ rvpn/crates/rvpn-mobile/Cargo.toml            | 11 ++++++++++
+ rvpn/crates/rvpn-mobile/src/doh_client.rs     |  4 ++--
+ rvpn/crates/rvpn-mobile/src/flow_connector.rs | 16 +++++++++-----
+ rvpn/crates/rvpn-mobile/src/ios_tun.rs        | 11 ++++++++++
+ rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs    |  6 +++--
+ rvpn/crates/rvpn-mobile/src/lib.rs            | 21 +++++++++++++++---
+ rvpn/crates/rvpn-mobile/src/server_session.rs | 22 ++++++++++---------
+ 8 files changed, 70 insertions(+), 23 deletions(-)
+ create mode 100644 .gitignore
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..407892e
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++target/
++Cargo.lock.bak
+diff --git a/rvpn/crates/rvpn-mobile/Cargo.toml b/rvpn/crates/rvpn-mobile/Cargo.toml
+index 20d5f64..e1a61b2 100644
+--- a/rvpn/crates/rvpn-mobile/Cargo.toml
++++ b/rvpn/crates/rvpn-mobile/Cargo.toml
+@@ -112,6 +112,12 @@ tracing-oslog = { version = "0.2", optional = true }
+ # macOS keeps builtin IPs/domains (no 50MB NetworkExtension jetsam limit)
+ rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
+ 
++# Windows-specific dependencies
++# Windows keeps builtin IPs/domains (bypass-country split tunnel data,
++# used by the rvpn-windows desktop client's route setup).
++[target.'cfg(target_os = "windows")'.dependencies]
++rvpn-split-tunnel = { path = "../rvpn-split-tunnel" }
++
+ # Android-specific dependencies
+ [target.'cfg(target_os = "android")'.dependencies]
+ # Android keeps builtin IPs/domains (no 50MB jetsam limit)
+@@ -137,6 +143,11 @@ ios-direct-tun = ["rvpn-tls/rustls"]
+ # Enable macOS Direct TUN mode (uses same ios_tun implementation as iOS).
+ # Selects the boring TLS backend to retain Chrome ClientHello fingerprint mimicry.
+ macos-direct-tun = ["rvpn-tls/boring"]
++# Enable Windows Direct TUN mode (uses same ios_tun implementation as iOS).
++# Selects the rustls TLS backend — same stack as the iOS production builds;
++# boring (BoringSSL) would require cmake/nasm to build on Windows MSVC and is
++# not needed for protocol correctness (the protocol requires TLS 1.3 only).
++windows-direct-tun = ["dns", "rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls", "rvpn-tls/rustls"]
+ # Enable Android Direct TUN mode (uses android_tun_ffi instead of legacy TunBridge)
+ android-direct-tun = ["rustls", "tokio-rustls", "rustls-platform-verifier", "webpki-roots", "tokio-tungstenite/__rustls-tls", "rvpn-tls/rustls"]
+ # Enable HarmonyOS NEXT NAPI FFI (uses rustls, same TLS stack as Android).
+diff --git a/rvpn/crates/rvpn-mobile/src/doh_client.rs b/rvpn/crates/rvpn-mobile/src/doh_client.rs
+index 5e68e1c..4501ce2 100644
+--- a/rvpn/crates/rvpn-mobile/src/doh_client.rs
++++ b/rvpn/crates/rvpn-mobile/src/doh_client.rs
+@@ -363,7 +363,7 @@ impl DohClient {
+         #[cfg(not(feature = "android-direct-tun"))]
+         let (ws_stream, _) = {
+             let tls_stream = {
+-                #[cfg(feature = "ios-direct-tun")]
++                #[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+                 let s = rvpn_tls::connect_rustls_with_store(
+                     &config.server_host,
+                     config.server_port,
+@@ -372,7 +372,7 @@ impl DohClient {
+                 )
+                 .await
+                 .context("DNS TLS handshake failed")?;
+-                #[cfg(not(feature = "ios-direct-tun"))]
++                #[cfg(not(any(feature = "ios-direct-tun", feature = "windows-direct-tun")))]
+                 let s = rvpn_tls::connect_chrome_like_with_resumption(
+                     &config.server_host,
+                     config.server_port,
+diff --git a/rvpn/crates/rvpn-mobile/src/flow_connector.rs b/rvpn/crates/rvpn-mobile/src/flow_connector.rs
+index 6f06576..507438e 100644
+--- a/rvpn/crates/rvpn-mobile/src/flow_connector.rs
++++ b/rvpn/crates/rvpn-mobile/src/flow_connector.rs
+@@ -27,9 +27,9 @@ type WsSink = SplitSink<WebSocketStream<rvpn_tls::ChromeTlsStream>, Message>;
+ #[cfg(feature = "macos-direct-tun")]
+ type WsStream = futures_util::stream::SplitStream<WebSocketStream<rvpn_tls::ChromeTlsStream>>;
+ 
+-#[cfg(feature = "ios-direct-tun")]
++#[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+ type WsSink = SplitSink<WebSocketStream<rvpn_tls::RustlsTlsStream>, Message>;
+-#[cfg(feature = "ios-direct-tun")]
++#[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+ type WsStream = futures_util::stream::SplitStream<WebSocketStream<rvpn_tls::RustlsTlsStream>>;
+ 
+ // Android: use tokio-tungstenite's built-in TLS (rustls)
+@@ -52,8 +52,12 @@ pub struct FlowConnectorConfig {
+     /// `/dns` WebSocket's reconnects resume (1-RTT PSK, no certificate
+     /// flight) just like the tunnel's. `None` keeps the backend default.
+     /// Android's DoH arm builds its rustls config inline and is not wired
+-    /// for resumption yet, so the field is gated to iOS/macOS.
+-    #[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
++    /// for resumption yet, so the field is gated to iOS/macOS/Windows.
++    #[cfg(any(
++        feature = "ios-direct-tun",
++        feature = "macos-direct-tun",
++        feature = "windows-direct-tun"
++    ))]
+     pub resumption: Option<rvpn_tls::ResumptionStore>,
+ }
+ 
+@@ -120,11 +124,11 @@ pub async fn create_flow_connection(
+     #[cfg(not(feature = "android-direct-tun"))]
+     let (ws_stream, _) = {
+         let tls_stream = {
+-            #[cfg(feature = "ios-direct-tun")]
++            #[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+             let s = rvpn_tls::connect_rustls(&config.server_host, config.server_port, Some(&config.server_host))
+                 .await
+                 .context("TLS handshake failed")?;
+-            #[cfg(not(feature = "ios-direct-tun"))]
++            #[cfg(not(any(feature = "ios-direct-tun", feature = "windows-direct-tun")))]
+             let s = rvpn_tls::connect_chrome_like(
+                 &config.server_host,
+                 config.server_port,
+diff --git a/rvpn/crates/rvpn-mobile/src/ios_tun.rs b/rvpn/crates/rvpn-mobile/src/ios_tun.rs
+index 4f69593..5232156 100644
+--- a/rvpn/crates/rvpn-mobile/src/ios_tun.rs
++++ b/rvpn/crates/rvpn-mobile/src/ios_tun.rs
+@@ -207,6 +207,10 @@ pub(crate) fn vm_internal_compressed() -> (u64, u64) {
+     (internal, compressed)
+ }
+ 
++// libmalloc zone APIs are Apple-only. On Windows (`windows-direct-tun`) the
++// zone helpers below compile to no-ops — the Windows allocator has no zones
++// and the reconnect loop's leak bookkeeping is Apple jetsam diagnostics.
++#[cfg(target_vendor = "apple")]
+ extern "C" {
+     fn malloc_get_all_zones(
+         task: libc::mach_port_t,
+@@ -298,6 +302,7 @@ fn vm_region_tags_str() -> String {
+ 
+ /// Enumerate every malloc zone in this task. Returns the zone pointer slice
+ /// (the array is owned by libmalloc; do not free).
++#[cfg(target_vendor = "apple")]
+ fn all_zone_ptrs() -> Vec<*mut std::ffi::c_void> {
+     let mut array: *mut usize = std::ptr::null_mut();
+     let mut count: u32 = 0;
+@@ -357,6 +362,7 @@ pub(crate) fn zone_sizes_str() -> String {
+ /// zone alone does not cover the nano zone (where small BoringSSL allocations
+ /// live), so we must relief ALL zones. Non-disruptive (no live allocations,
+ /// no tunnel drop). Called from the 15 s keepalive.
++#[cfg(target_vendor = "apple")]
+ pub(crate) fn all_zones_pressure_relief() {
+     for zone in all_zone_ptrs() {
+         unsafe {
+@@ -365,6 +371,11 @@ pub(crate) fn all_zones_pressure_relief() {
+     }
+ }
+ 
++/// Non-Apple no-op for the keepalive call site — other platforms have no
++/// libmalloc zones and nothing to relief.
++#[cfg(not(target_vendor = "apple"))]
++pub(crate) fn all_zones_pressure_relief() {}
++
+ /// Sum of live bytes-in-use across ALL malloc zones. If this stays flat while
+ /// `headroom_bytes` declines, the growth is NOT in any malloc zone (it's in
+ /// vm/mmap regions or compressed pages) and malloc-level relief can't help.
+diff --git a/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs b/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs
+index 0c552fe..93d2e4c 100644
+--- a/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs
++++ b/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs
+@@ -715,7 +715,7 @@ pub extern "C" fn rvpn_tun_start() -> c_int {
+ /// mDNSResponder on macOS; iOS uses 127.0.0.1:15353) and resolves queries
+ /// through the tunnel via a DoH WebSocket to `<server_path>/dns`.
+ #[cfg(feature = "dns")]
+-async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::Result<()> {
++pub async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyhow::Result<()> {
+     info!(
+         "[IOS_TUN_FFI] Starting DNS proxy on {} (enable_dns_proxy={})",
+         client.get_dns_bind_addr(),
+@@ -1187,7 +1187,9 @@ pub extern "C" fn rvpn_tun_get_rss_bytes() -> u64 {
+ /// `get_rss_bytes` — so we expose an unconditional wrapper that reads the
+ /// same Mach `task_info` and returns 0 on failure. Costs a couple of
+ /// microseconds per call.
+-#[cfg(not(feature = "diagnostics"))]
++/// Windows (`windows-direct-tun`) has no Mach — the host app reads process
++/// memory through its own OS APIs, so the symbol is Apple-only.
++#[cfg(all(not(feature = "diagnostics"), target_vendor = "apple"))]
+ #[no_mangle]
+ pub extern "C" fn rvpn_tun_get_rss_bytes() -> u64 {
+     const MACH_TASK_BASIC_INFO: u32 = 20;
+diff --git a/rvpn/crates/rvpn-mobile/src/lib.rs b/rvpn/crates/rvpn-mobile/src/lib.rs
+index 6ee8715..819da22 100644
+--- a/rvpn/crates/rvpn-mobile/src/lib.rs
++++ b/rvpn/crates/rvpn-mobile/src/lib.rs
+@@ -37,12 +37,27 @@ pub mod flow_connector;
+ pub mod ws;
+ 
+ // iOS Direct TUN mode - implementation using IosTunClient
+-#[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
++// (also compiled on Windows by the rvpn-windows desktop client via the
++// `windows-direct-tun` feature; the implementation itself is host-agnostic —
++// the host app owns the TUN device and exchanges raw IP packets natively)
++#[cfg(any(
++    feature = "ios-direct-tun",
++    feature = "macos-direct-tun",
++    feature = "windows-direct-tun"
++))]
+ pub mod ios_tun;
+ // Per-exit-server session state/logic extracted from ios_tun (multi-server prep)
+-#[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
++#[cfg(any(
++    feature = "ios-direct-tun",
++    feature = "macos-direct-tun",
++    feature = "windows-direct-tun"
++))]
+ pub mod ios_tun_ffi;
+-#[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
++#[cfg(any(
++    feature = "ios-direct-tun",
++    feature = "macos-direct-tun",
++    feature = "windows-direct-tun"
++))]
+ pub mod server_session;
+ #[cfg(any(feature = "ios-direct-tun", feature = "macos-direct-tun"))]
+ pub mod swift_crypto;
+diff --git a/rvpn/crates/rvpn-mobile/src/server_session.rs b/rvpn/crates/rvpn-mobile/src/server_session.rs
+index 224e071..ddaeed5 100644
+--- a/rvpn/crates/rvpn-mobile/src/server_session.rs
++++ b/rvpn/crates/rvpn-mobile/src/server_session.rs
+@@ -80,18 +80,20 @@ fn mem_stats_suffix() -> String {
+ /// iOS uses the rustls backend (`rvpn_tls::RustlsTlsStream`) — native-tls
+ /// (Security.framework) cannot negotiate TLS 1.3 on iOS, and the protocol
+ /// requires TLS 1.3. macOS (same file, `macos-direct-tun` feature) keeps
+-/// the boring backend for Chrome ClientHello fingerprint mimicry.
+-#[cfg(feature = "ios-direct-tun")]
++/// the boring backend for Chrome ClientHello fingerprint mimicry. Windows
++/// (`windows-direct-tun`) uses rustls like iOS — BoringSSL would require
++/// cmake/nasm on MSVC for no protocol benefit.
++#[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+ type WsReader = MinimalWsReader<rvpn_tls::RustlsTlsStream>;
+-#[cfg(feature = "ios-direct-tun")]
++#[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+ type WsWriter = MinimalWsWriter<rvpn_tls::RustlsTlsStream>;
+-#[cfg(feature = "ios-direct-tun")]
++#[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+ type TunnelWs = rvpn_tls::RustlsTlsStream;
+-#[cfg(not(feature = "ios-direct-tun"))]
++#[cfg(not(any(feature = "ios-direct-tun", feature = "windows-direct-tun")))]
+ type WsReader = MinimalWsReader<rvpn_tls::ChromeTlsStream>;
+-#[cfg(not(feature = "ios-direct-tun"))]
++#[cfg(not(any(feature = "ios-direct-tun", feature = "windows-direct-tun")))]
+ type WsWriter = MinimalWsWriter<rvpn_tls::ChromeTlsStream>;
+-#[cfg(not(feature = "ios-direct-tun"))]
++#[cfg(not(any(feature = "ios-direct-tun", feature = "windows-direct-tun")))]
+ type TunnelWs = rvpn_tls::ChromeTlsStream;
+ 
+ /// Maximum age of a preconnected transport before connect() discards it.
+@@ -521,7 +523,7 @@ impl ServerSession {
+         // portal, dead interface after a 4G/5G↔WiFi flap) hangs one attempt
+         // for the OS TCP timeout (~75s); on expiry this produces a normal
+         // connect error that the existing backoff loop handles.
+-        #[cfg(feature = "ios-direct-tun")]
++        #[cfg(any(feature = "ios-direct-tun", feature = "windows-direct-tun"))]
+         let tls_stream = timeout(
+             std::time::Duration::from_secs(10),
+             rvpn_tls::connect_rustls_with_store(
+@@ -535,7 +537,7 @@ impl ServerSession {
+         .context("TCP connect + TLS handshake timeout (10s)")?
+         .context("TLS handshake failed")?;
+ 
+-        #[cfg(not(feature = "ios-direct-tun"))]
++        #[cfg(not(any(feature = "ios-direct-tun", feature = "windows-direct-tun")))]
+         let tls_stream = timeout(
+             std::time::Duration::from_secs(10),
+             rvpn_tls::connect_chrome_like_with_resumption(
+@@ -552,7 +554,7 @@ impl ServerSession {
+ 
+         info!(
+             "[IosTun] TLS connected ({})",
+-            if cfg!(feature = "ios-direct-tun") {
++            if cfg!(any(feature = "ios-direct-tun", feature = "windows-direct-tun")) {
+                 "rustls"
+             } else {
+                 "Chrome fingerprint"
+-- 
+2.51.0.windows.1
+

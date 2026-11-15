@@ -1,0 +1,98 @@
+# Patches to rVPN-core (upstream)
+
+The Windows client depends on a small, surgical patch set against
+[`PDG-Global/rVPN-core`](https://github.com/PDG-Global/rVPN-core). It is
+committed on the `windows-client` branch of the sibling `../rVPN-core`
+checkout, and mirrored in `patches/` here.
+
+Highlights:
+
+1. `windows-direct-tun` feature on `rvpn-mobile` (porting + gating; see below).
+2. **Upstream bug fix** — `MinimalWsReader::next_frame` parsed a frame only
+   after a *successful* read; frames delivered behind the first in one TCP
+   segment were stuck forever. Fixed with a parse-before-read loop and a
+   regression unit test.
+3. **Proxy mode (SOCKS5/4a frontend + per-flow relay)** — the in-tree
+   `socks5_server` was dead code (never declared) and its Bypass path only
+   answered with a SOCKS error for iOS to retry; `flow_connector`'s framing
+   was broken (JSON instead of binary, no padding). Both now work end-to-end
+   and SOCKS4/4a — the dialect Windows' own system proxy speaks — is
+   accepted, so proxy mode can drive the WinINET system proxy.
+4. **Large-write relay fix** (`0007`) — the per-flow mobile relay read up to
+   16 KiB, which cannot fit in a 16 KiB padded packet once the padding
+   trailer is added. It now uses the CLI's 8190-byte read size. A regression
+   test reconstructs a 65537-byte browser write across padded chunks. The
+   protocol and server do not change. The patch includes this local change
+   without requiring a commit in the upstream checkout.
+
+## Extra-root TLS deployments
+
+`rvpn-tls` (rustls backend) accepts `RVPN_TLS_ROOT_CA=/path/to.pem` to
+append extra trust roots — for servers terminating TLS with a private CA or
+a direct-IP certificate (no public CA issues certificates for bare IPs, so
+a domain + Let's Encrypt remains the recommended production setup).
+
+## Summary of changes
+
+### 1. `rvpn/crates/rvpn-mobile/Cargo.toml`
+
+- New feature **`windows-direct-tun`** — mirrors the iOS feature set
+  (rustls TLS backend, `dns`) so the direct-TUN engine modules compile on
+  Windows:
+  ```toml
+  windows-direct-tun = ["dns", "rustls", "tokio-rustls", "rustls-platform-verifier",
+                        "webpki-roots", "tokio-tungstenite/__rustls-tls", "rvpn-tls/rustls"]
+  ```
+- `[target.'cfg(target_os = "windows")'.dependencies]` re-enables
+  `rvpn-split-tunnel` with builtin data (bypass-country CIDR lists), the
+  same as the existing macOS/Android target blocks.
+
+### 2. `rvpn/crates/rvpn-mobile/src/lib.rs`
+
+- The host-agnostic direct-TUN modules (`ios_tun`, `ios_tun_ffi`,
+  `server_session`) now also compile under `windows-direct-tun`.
+  `swift_crypto` remains iOS/macOS-only.
+
+### 3. `rvpn/crates/rvpn-mobile/src/server_session.rs`
+
+- TLS type aliases and the connect call select **rustls** when
+  `ios-direct-tun` **or** `windows-direct-tun` (previously iOS-only); the
+  boring (Chrome-mimicry) branch applies otherwise, unchanged.
+
+### 4. `rvpn/crates/rvpn-mobile/src/flow_connector.rs` and `doh_client.rs`
+
+- Same rustls/boring feature split extended to `windows-direct-tun`;
+  `FlowConnectorConfig::resumption` field gating extended (was
+  iOS/macOS-only).
+
+### 5. `rvpn/crates/rvpn-mobile/src/ios_tun.rs`
+
+- Apple-only code — the libmalloc `extern "C"` zone APIs,
+  `all_zone_ptrs`, `all_zones_pressure_relief` — is now gated behind
+  `target_vendor = "apple"` with a no-op `all_zones_pressure_relief` stub
+  for other vendors (it is called unconditionally by the keepalive).
+  Behaviour on Apple platforms is unchanged.
+
+### 6. `rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs`
+
+- `start_dns_proxy_for_direct_tun` is now `pub` so host apps can start the
+  loopback DoH DNS proxy natively in-process (the Windows client does).
+- The non-diagnostics `rvpn_tun_get_rss_bytes` Mach reader is now Apple-only
+  (no Mach on Windows).
+
+### 7. `rvpn/crates/rvpn-mobile/src/ws.rs` (upstream bug fix)
+
+- `MinimalWsReader::next_frame` extracted a `try_parse_frame` helper and
+  parses buffered frames **before** waiting on the stream (commit 2 above).
+
+### 8. `rvpn/crates/rvpn-tls` (rustls backend)
+
+- Optional `RVPN_TLS_ROOT_CA` extra roots via `rustls-pemfile` (see above).
+
+## Why rustls instead of BoringSSL on Windows?
+
+The macOS client uses the boring backend to mimic Chrome's ClientHello
+shape. Building BoringSSL on Windows MSVC requires cmake + nasm in the
+toolchain. The iOS production builds already ship rustls — TLS 1.3 is all
+the protocol requires — so Windows follows iOS. Switching later only
+involves flipping the feature wiring above (plus a cmake/nasm CI step).
