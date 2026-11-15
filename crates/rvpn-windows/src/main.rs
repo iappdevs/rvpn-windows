@@ -7,6 +7,9 @@
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    if rvpn_windows::sysproxy::run_watchdog_from_args() {
+        return Ok(());
+    }
     // Single instance: if another copy is already running (usually parked in
     // the tray), surface its window instead of starting a second one.
     let Some(_instance) = rvpn_windows::platform::SingleInstance::try_acquire() else {
@@ -21,11 +24,21 @@ fn main() -> eframe::Result<()> {
     // and restore the system proxy if a proxy session died uncleanly.
     rvpn_windows::winroute::sweep_stale_state();
     rvpn_windows::sysproxy::sweep_stale_system_proxy();
+    struct RestoreProxyOnExit;
+    impl Drop for RestoreProxyOnExit {
+        fn drop(&mut self) {
+            rvpn_windows::sysproxy::restore_system_proxy();
+        }
+    }
+    let _restore_proxy = RestoreProxyOnExit;
 
     // Logging: GUI ring + capped file. Set RVPN_LOG_LEVEL=debug|trace for
     // engine diagnostics (same variable the upstream apps honour).
     let ring = rvpn_windows::logging::LogRing::default();
-    rvpn_windows::logging::init(&ring, Some(rvpn_windows::paths::log_dir().join("rvpn-windows.log")));
+    rvpn_windows::logging::init(
+        &ring,
+        Some(rvpn_windows::paths::log_dir().join("rvpn-windows.log")),
+    );
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "rvpn-windows starting");
 
     // The tray must be created before the GUI loop so its Win32 message
@@ -35,8 +48,8 @@ fn main() -> eframe::Result<()> {
     let icon = window_icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 640.0])
-            .with_min_inner_size([780.0, 540.0])
+            .with_inner_size([1200.0, 860.0])
+            .with_min_inner_size([1020.0, 740.0])
             .with_icon(std::sync::Arc::new(icon))
             .with_title("R-VPN"),
         ..Default::default()
@@ -64,22 +77,7 @@ fn main() -> eframe::Result<()> {
 }
 
 fn style(cc: &eframe::CreationContext<'_>) {
-    use egui::{CornerRadius, Style, Visuals};
-    let mut style = Style::default();
-    style.visuals = Visuals::dark();
-    style.visuals.panel_fill = egui::Color32::from_rgb(18, 21, 26);
-    style.visuals.window_fill = egui::Color32::from_rgb(24, 28, 34);
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(12, 14, 17);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(24, 28, 34);
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(20, 34, 28);
-    style.visuals.selection.stroke.color = egui::Color32::from_rgb(46, 184, 114);
-    style.visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 28, 34);
-    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 35, 42);
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 42, 51);
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(20, 34, 28);
-    style.visuals.window_corner_radius = CornerRadius::same(10);
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    cc.egui_ctx.set_style(style);
+    rvpn_windows::ui::apply(&cc.egui_ctx);
 }
 
 fn window_icon() -> egui::IconData {

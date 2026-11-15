@@ -1,0 +1,87 @@
+diff --git a/rvpn/crates/rvpn-mobile/src/flow_connector.rs b/rvpn/crates/rvpn-mobile/src/flow_connector.rs
+index 608764e..a908b92 100644
+--- a/rvpn/crates/rvpn-mobile/src/flow_connector.rs
++++ b/rvpn/crates/rvpn-mobile/src/flow_connector.rs
+@@ -384,8 +384,8 @@ where
+     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+ {
+     use rvpn_core::crypto::ratchet::RatchetMessage;
+-    use rvpn_core::protocol::padding::{pad_packet, unpad_packet};
+-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use rvpn_core::protocol::padding::unpad_packet;
++    use tokio::io::AsyncWriteExt;
+ 
+     let flow_id = rand_id();
+     let url = format!("wss://{}:{}{}", config.server_host, config.server_port, config.server_path);
+@@ -445,19 +445,17 @@ where
+ 
+     // Bidirectional copy: after the target message the data path is raw
+     // payloads (1 KB-boundary padded, Data AAD) — one flow per connection.
+-    let mut buf = vec![0u8; 16 * 1024];
++    // Match the CLI relay: leave room for padding metadata. A 16 KiB
++    // socket read cannot fit in a 16 KiB padded packet and kills the flow.
++    let mut buf = vec![0u8; RELAY_READ_CHUNK];
+     let mut up: u64 = 0;
+     let mut down: u64 = 0;
+     loop {
+         tokio::select! {
+-            readable = socket.read(&mut buf) => {
+-                let n = readable.context("local socket read failed")?;
+-                if n == 0 {
+-                    break; // local side closed
+-                }
++            readable = read_padded_relay_chunk(socket, &mut buf) => {
++                let Some((n, padded)) = readable? else { break };
+                 up += n as u64;
+                 on_bytes(up, down);
+-                let padded = pad_packet(&buf[..n]).context("padding failed")?;
+                 let message = ratchet
+                     .encrypt(&padded, &[0x01])
+                     .map_err(|e| anyhow::anyhow!("encrypt failed: {e:?}"))?;
+@@ -493,3 +491,46 @@ where
+     let _ = ws_write.send(Message::Close(None)).await;
+     Ok(())
+ }
++
++const RELAY_READ_CHUNK: usize = 8190;
++
++async fn read_padded_relay_chunk<S>(
++    socket: &mut S,
++    buf: &mut [u8],
++) -> Result<Option<(usize, Vec<u8>)>>
++where
++    S: tokio::io::AsyncRead + Unpin,
++{
++    use tokio::io::AsyncReadExt;
++    let n = socket.read(buf).await.context("local socket read failed")?;
++    if n == 0 {
++        return Ok(None);
++    }
++    let padded = rvpn_core::protocol::padding::pad_packet(&buf[..n]).context("padding failed")?;
++    Ok(Some((n, padded)))
++}
++
++#[cfg(test)]
++mod relay_chunk_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn large_browser_writes_survive_padding_without_losing_bytes() {
++        // Reproduces the previous failure: one full 16 KiB socket read
++        // cannot be padded because the trailer also needs space.
++        assert!(rvpn_core::protocol::padding::pad_packet(&vec![0; 16 * 1024]).is_err());
++        let expected: Vec<u8> = (0..65537).map(|i| (i % 251) as u8).collect();
++        let mut input = expected.as_slice();
++        let mut actual = vec![];
++        let mut buffer = vec![0; RELAY_READ_CHUNK];
++        while let Some((n, padded)) = read_padded_relay_chunk(&mut input, &mut buffer)
++            .await
++            .unwrap()
++        {
++            let plain = rvpn_core::protocol::padding::unpad_packet(&padded).unwrap();
++            assert_eq!(plain.len(), n);
++            actual.extend(plain);
++        }
++        assert_eq!(actual, expected);
++    }
++}

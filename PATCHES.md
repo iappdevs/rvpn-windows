@@ -18,6 +18,12 @@ Highlights:
    was broken (JSON instead of binary, no padding). Both now work end-to-end
    and SOCKS4/4a — the dialect Windows' own system proxy speaks — is
    accepted, so proxy mode can drive the WinINET system proxy.
+4. **Large-write relay fix** (`0007`) — the per-flow mobile relay read up to
+   16 KiB, which cannot fit in a 16 KiB padded packet once the padding
+   trailer is added. It now uses the CLI's 8190-byte read size. A regression
+   test reconstructs a 65537-byte browser write across padded chunks. The
+   protocol and server do not change. The patch includes this local change
+   without requiring a commit in the upstream checkout.
 
 ## Extra-root TLS deployments
 

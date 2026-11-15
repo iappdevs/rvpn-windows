@@ -131,3 +131,91 @@ mod tests {
         assert!(third.is_some());
     }
 }
+
+// ============================================================================
+// Main-window visibility (Win32, independent of the egui repaint loop)
+//
+// Hiding the egui viewport via ViewportCommand::Visible(false) lets the
+// winit loop stall once hidden — the matching Visible(true) from a tray
+// click is then never processed and the window stays gone forever. These
+// helpers drive the real HWND instead, which works regardless of repaints.
+// ============================================================================
+
+use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
+
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+extern "system" fn enum_windows_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    _lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::BOOL {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != std::process::id() {
+            return 1; // not ours — keep enumerating
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return 1; // untitled helper window (tray, message-only)
+        }
+        let mut buf = vec![0u16; (len + 1) as usize];
+        let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
+        let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        // All our viewport titles start with "R-VPN" ("R-VPN — Connected", …).
+        if title.starts_with("R-VPN") {
+            MAIN_HWND.store(hwnd as isize, AtomicOrdering::SeqCst);
+            return 0; // found — stop
+        }
+        1
+    }
+}
+
+/// Find (once) the HWND of the main window of THIS process.
+fn main_window_handle() -> windows_sys::Win32::Foundation::HWND {
+    let cached = MAIN_HWND.load(AtomicOrdering::SeqCst);
+    if cached != 0 {
+        return cached as windows_sys::Win32::Foundation::HWND;
+    }
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows(
+            Some(enum_windows_proc),
+            0,
+        );
+    }
+    MAIN_HWND.load(AtomicOrdering::SeqCst) as windows_sys::Win32::Foundation::HWND
+}
+
+/// Bring the main window up from the tray (no-op if already visible).
+pub fn show_main_window() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+    let hwnd = main_window_handle();
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Park the main window in the tray (no-op if already hidden).
+pub fn hide_main_window() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE};
+    let hwnd = main_window_handle();
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if IsWindowVisible(hwnd) != 0 {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}

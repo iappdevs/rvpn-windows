@@ -39,6 +39,10 @@ pub struct Profile {
     /// compiled-in builtin ranges for the listed countries.
     #[serde(default)]
     pub country_ips_file: Option<String>,
+    /// Ordered Direct/Proxy/Block rules for the local system-proxy inbound.
+    /// None imports the previous split-tunnel settings without rewriting them.
+    #[serde(default)]
+    pub routing: Option<crate::routing::RoutingConfig>,
     /// Optional TLS SNI override (defaults to the URL host).
     #[serde(default)]
     pub sni_hostname: Option<String>,
@@ -53,7 +57,7 @@ pub struct Profile {
     /// TUN MTU (default 1420, same as the macOS app).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
-    /// Ad/tracker blocking at the DNS layer. Always on, like the macOS app.
+    /// Ad/tracker blocking (DNS in TUN mode, geosite rules in proxy mode).
     #[serde(default = "default_true")]
     pub block_ads: bool,
     /// Split-tunnel master toggle (bypass lists + builtin country data).
@@ -123,6 +127,7 @@ impl Profile {
             proxy_port: default_proxy_port(),
             bypass_dns_servers: default_bypass_dns(),
             country_ips_file: None,
+            routing: None,
             server_address: String::new(),
             sni_hostname: None,
             server_identity_pin: None,
@@ -373,6 +378,9 @@ pub struct AppSettings {
     /// Hide the window at launch (tray only).
     #[serde(default)]
     pub start_minimized: bool,
+    /// Explicit opt-in: otherwise closing the window disconnects and exits.
+    #[serde(default)]
+    pub close_to_tray: bool,
 }
 
 impl Default for AppSettings {
@@ -381,6 +389,7 @@ impl Default for AppSettings {
             auto_connect: false,
             launch_at_startup: false,
             start_minimized: false,
+            close_to_tray: false,
         }
     }
 }
@@ -403,6 +412,15 @@ impl fmt::Display for Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_settings_migrate_to_disconnect_on_close() {
+        let settings:AppSettings=serde_json::from_str(r#"{"auto_connect":true,"start_minimized":true}"#).unwrap();
+        assert!(!settings.close_to_tray);
+        assert!(settings.auto_connect);
+        let opted_in:AppSettings=serde_json::from_str(r#"{"close_to_tray":true}"#).unwrap();
+        assert!(opted_in.close_to_tray);
+    }
 
     #[test]
     fn slugify_basic() {

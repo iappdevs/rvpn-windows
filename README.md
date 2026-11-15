@@ -12,6 +12,16 @@ used in-process, with no FFI boundary.
 
 ## Features
 
+- **System proxy routing** — mixed HTTP/SOCKS inbound, ordered Direct/Proxy/
+  Block rules, bundled GeoIP (including Iran) and GeoSite data, and a routing
+  editor with country selection and a route tester. See [ROUTING.md](ROUTING.md).
+  Country classification resolves DNS through the encrypted tunnel, so
+  local filtering answers cannot cause an unintended Direct connection.
+  Before each Proxy connection, GeoIP/GeoSite updates are checked through the
+  internal tunnel and verified before Windows system proxy is enabled.
+  Downloads persist across launches; an unavailable update keeps the last
+  verified data (or the embedded fallback) and shows a warning in Connect.
+
 - **Full-tunnel TUN mode** via Wintun — all IPv4 traffic routed through the
   tunnel (`0.0.0.0/1` + `128.0.0.0/1` half-default routes)
 - **IPv6 leak guard** — v6 default routes pinned to the tunnel; packets are
@@ -25,8 +35,13 @@ used in-process, with no FFI boundary.
   capture and a mismatch alert dialog — same trust model as the macOS app
 - **Profiles** (up to 10) with identity keygen/import, prekey bundle import,
   and `.rvpn` export/import (with or without the private key)
-- **Tray-first UX** — state-coloured tray icon, connect/disconnect from the
-  menu, window parks to tray on close
+- **A redesigned workspace** — a connection dashboard, profile cards,
+  grouped settings, searchable activity and a consistent dark visual theme.
+- **Clear exit behavior** — closing the window disconnects and exits by default.
+  Keep running in the tray is an explicit Settings option. Exit waits for
+  cleanup and restores Windows proxy settings before stopping the listener.
+  A hidden helper from the same executable watches unexpected process exits;
+  startup recovery remains a fallback if the entire process tree is terminated.
 - **Auto-reconnect** with PSK TLS resumption (1-RTT), re-addressing when the
   server assigns a new virtual IP
 - Single instance, launch-at-startup, live log view, capped log files
@@ -38,7 +53,8 @@ rvpn-windows.exe   the client (requires Administrator — UAC prompt on launch)
 wintun.dll         the official Wintun 0.14.1 driver binding (amd64)
 ```
 
-Both files must sit in the same folder.
+Both files must sit in the same folder. The cleanup helper uses the same
+executable; no separate helper binary is distributed.
 
 ## Building
 

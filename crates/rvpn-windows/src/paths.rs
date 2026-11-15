@@ -18,6 +18,11 @@ pub fn log_dir() -> PathBuf {
     base.join("rvpn-windows").join("logs")
 }
 
+/// Verified GeoIP/GeoSite generations and their atomic active pointer.
+pub fn geodata_dir() -> PathBuf {
+    log_dir().parent().expect("log directory has a parent").join("geodata")
+}
+
 /// Per-profile directory: `<app_data>/profiles/<slug>/`
 pub fn profile_dir(slug: &str) -> PathBuf {
     app_data_dir().join("profiles").join(slug)

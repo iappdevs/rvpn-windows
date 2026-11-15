@@ -41,11 +41,17 @@ pub enum EngineEvent {
     /// First-connection TOFU capture: pin the user should persist.
     TofuCaptured { slug: String, pin: String },
     /// Stored pin does not match the server.
-    TofuMismatch { slug: String, expected: String, actual: String },
+    TofuMismatch {
+        slug: String,
+        expected: String,
+        actual: String,
+    },
     /// Server-assigned address changed after a reconnect; routes updated.
     Readdressed { ip: String, gateway: String },
     /// Informational notice for the UI (non-fatal).
     Notice(String),
+    /// Result of the pre-connect database update, retained in the status card.
+    GeoDataStatus { description: String, warning: bool },
     /// Engine fully stopped (teardown finished).
     Stopped,
 }
@@ -55,10 +61,18 @@ pub enum EnginePhase {
     Idle,
     Starting,
     /// Handshake / Windows plumbing in progress.
-    Connecting { detail: String },
-    Connected { ip: String, gateway: String, server: String },
+    Connecting {
+        detail: String,
+    },
+    Connected {
+        ip: String,
+        gateway: String,
+        server: String,
+    },
     /// Engine reports failure; teardown follows.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     Stopping,
 }
 
@@ -85,7 +99,11 @@ fn send_event(ev: EngineEvent) {
 
 /// The engine's C-ABI state callback: logging only. Phase events for the UI
 /// are derived by the engine thread, which has profile context.
-unsafe extern "C" fn state_callback(state: i32, ip: *const std::os::raw::c_char, _msg: *const std::os::raw::c_char) {
+unsafe extern "C" fn state_callback(
+    state: i32,
+    ip: *const std::os::raw::c_char,
+    _msg: *const std::os::raw::c_char,
+) {
     let ip_str = if ip.is_null() {
         String::new()
     } else {
@@ -112,6 +130,8 @@ pub struct EngineInner {
     pumps: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Set once teardown has run (or a connect attempt definitively failed).
     torn_down: AtomicBool,
+    stop_requested: AtomicBool,
+    teardown_done: (Mutex<bool>, std::sync::Condvar),
 }
 
 struct Teardown {
@@ -127,6 +147,7 @@ struct Teardown {
 
 /// Running pieces of proxy mode to unwind on stop.
 struct ProxyTeardown {
+    mixed: crate::proxy::MixedProxy,
     socks: rvpn_mobile::socks5_server::Socks5ServerHandle,
     flow_task: tokio::task::AbortHandle,
     udp_task: tokio::task::AbortHandle,
@@ -153,27 +174,46 @@ impl EngineHandle {
         profile: &Profile,
         events: std::sync::mpsc::Sender<EngineEvent>,
     ) -> EngineHandle {
+        Self::connect_cancellable(profile, events, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn connect_cancellable(
+        profile: &Profile,
+        events: std::sync::mpsc::Sender<EngineEvent>,
+        cancel: Arc<AtomicBool>,
+    ) -> EngineHandle {
         *EVENT_SINK.lock().unwrap() = Some(events);
 
         let handle = EngineHandle {
             inner: Arc::new(EngineInner {
                 phase: Mutex::new(EnginePhase::Starting),
-                stop_flag: Arc::new(AtomicBool::new(false)),
+                stop_flag: cancel,
                 rx_bytes: Arc::new(AtomicU64::new(0)),
                 tx_bytes: Arc::new(AtomicU64::new(0)),
                 connected_at: Mutex::new(None),
                 teardown: Mutex::new(None),
                 pumps: Mutex::new(Vec::new()),
                 torn_down: AtomicBool::new(false),
+                stop_requested: AtomicBool::new(false),
+                teardown_done: (Mutex::new(false), std::sync::Condvar::new()),
             }),
         };
 
-        let result = match profile.mode {
-            crate::profile::ConnMode::Tun => handle.run_connect(profile),
-            crate::profile::ConnMode::Proxy => handle.run_connect_proxy(profile),
+        let result = if handle.inner.stop_flag.load(Ordering::SeqCst) {
+            Err(anyhow::anyhow!("Connection cancelled"))
+        } else {
+            match profile.mode {
+                crate::profile::ConnMode::Tun => handle.run_connect(profile),
+                crate::profile::ConnMode::Proxy => handle.run_connect_proxy(profile),
+            }
         };
         match result {
             Ok(()) => {}
+            Err(_) if handle.inner.stop_flag.load(Ordering::SeqCst) => {
+                handle.teardown();
+                handle.set_phase(EnginePhase::Idle);
+                tracing::info!("connection cancelled");
+            }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "connect sequence failed");
                 let reason = format!("{e:#}");
@@ -208,7 +248,9 @@ impl EngineHandle {
                     expected: expected.clone(),
                     actual: actual_pin,
                 });
-                anyhow::bail!("server identity mismatch — pin stored in the profile differs from the bundle");
+                anyhow::bail!(
+                    "server identity mismatch — pin stored in the profile differs from the bundle"
+                );
             }
         }
 
@@ -224,34 +266,8 @@ impl EngineHandle {
         let bundle: rvpn_core::crypto::X3DHPublicBundle =
             serde_json::from_str(&bundle_text).context("invalid prekey bundle")?;
 
-        // Split-tunnel rules: bypass countries + inline CIDRs + the profile's
-        // bypass domains (written to a rules file — the SOCKS5 frontend takes
-        // domain lists from files) + optional custom country IP database.
-        let dir = profile.dir();
-        let bypass_domains_file = if profile.bypass_domains.is_empty() {
-            None
-        } else {
-            let path = dir.join("bypass-domains.txt");
-            std::fs::write(&path, profile.bypass_domains.join("\n"))
-                .context("failed to write the bypass-domains file")?;
-            Some(path)
-        };
-        let country_ips_file = profile
-            .country_ips_file
-            .as_ref()
-            .map(|name| dir.join(name))
-            .filter(|p| p.is_file());
-
-        let split = rvpn_mobile::rvpn_split_tunnel::SplitTunnelConfig {
-            enabled: true,
-            builtin_bypass_countries: profile.builtin_bypass_countries.clone(),
-            bypass_networks: profile.bypass_networks.clone(),
-            bypass_domains_file,
-            block_ads: profile.block_ads,
-            country_ips_file,
-            ..Default::default()
-        };
-
+        // Route once in the Windows mixed inbound. The internal SOCKS engine
+        // only carries Proxy outbounds; it must not re-apply bypass rules.
         let listen: std::net::SocketAddr = format!("127.0.0.1:{}", profile.proxy_port)
             .parse()
             .context("invalid proxy port")?;
@@ -276,13 +292,15 @@ impl EngineHandle {
             .unwrap_or((host_port.clone(), 443));
 
         let socks_config = Socks5ServerConfig {
-            listen_addr: listen,
-            split_tunnel: Some(split),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            split_tunnel: None,
             dns_config: Some(dns),
             direct_bypass: true,
         };
 
-        self.set_phase(EnginePhase::Connecting { detail: "starting proxy".into() });
+        self.set_phase(EnginePhase::Connecting {
+            detail: "starting proxy".into(),
+        });
         let server = runtime
             .block_on(Socks5Server::new(socks_config))
             .context("failed to initialize the SOCKS5 frontend")?;
@@ -294,7 +312,7 @@ impl EngineHandle {
         let handle = runtime
             .block_on(server.run_with_shutdown(tun_tx, _udp_tx))
             .context("failed to bind the SOCKS5 listener")?;
-        let local_addr = handle.local_addr;
+        let backend_addr = handle.local_addr;
 
         // TCP flows → per-flow encrypted WebSocket to the server.
         let flow_config = FlowConnectorConfig {
@@ -310,7 +328,7 @@ impl EngineHandle {
         let _stop = self.inner.stop_flag.clone();
         let rx_bytes = self.inner.rx_bytes.clone();
         let tx_bytes = self.inner.tx_bytes.clone();
-        let mut flow_task = {
+        let flow_task = {
             let flow_config = flow_config.clone();
             runtime.spawn(async move {
                 while let Some(req) = tun_rx.recv().await {
@@ -319,16 +337,13 @@ impl EngineHandle {
                     let tx = tx_bytes.clone();
                     tokio::spawn(async move {
                         let mut socket = req.socket;
-                        let mut addr = req.target_address.clone();
+                        let addr = req.target_address.clone();
                         // strip a possible trailing port split for host parse
                         let (host, port) = match addr.rsplit_once(':') {
                             Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(80)),
                             None => (addr.clone(), 80),
                         };
-                        if host.contains(':') && host.starts_with('[') {
-                            // IPv6 literal [::1]:443 — keep whole as host
-                            addr = addr.trim_start_matches('[').to_string();
-                        }
+                        let host = host.trim_matches(['[', ']']);
                         let counters = {
                             let rx = rx.clone();
                             let tx = tx.clone();
@@ -339,7 +354,7 @@ impl EngineHandle {
                         };
                         let result = rvpn_mobile::flow_connector::relay_flow(
                             &cfg,
-                            &host,
+                            host,
                             port,
                             &mut socket,
                             &counters,
@@ -360,7 +375,9 @@ impl EngineHandle {
             while let Some(req) = udp_rx.recv().await {
                 let _ = req
                     .completion_sender
-                    .send(Err(anyhow::anyhow!("UDP associate not supported in proxy mode")))
+                    .send(Err(anyhow::anyhow!(
+                        "UDP associate not supported in proxy mode"
+                    )))
                     .await;
             }
         });
@@ -368,10 +385,16 @@ impl EngineHandle {
         // Readiness probe: a SOCKS5 CONNECT through our own listener to a
         // harmless target proves TLS + X3DH + relay end-to-end before we
         // report Connected.
-        self.set_phase(EnginePhase::Connecting { detail: "handshaking".into() });
+        self.set_phase(EnginePhase::Connecting {
+            detail: "handshaking".into(),
+        });
         let probe = runtime.block_on(async {
+          tokio::select! {
+           _ = wait_for_cancel(self.inner.stop_flag.clone()) => false,
+           result = async {
+          tokio::time::timeout(std::time::Duration::from_secs(20), async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let Ok(mut s) = tokio::net::TcpStream::connect(local_addr).await else {
+            let Ok(mut s) = tokio::net::TcpStream::connect(backend_addr).await else {
                 return false;
             };
             if s.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
@@ -390,22 +413,59 @@ impl EngineHandle {
                 return false;
             }
             let mut resp = [0u8; 10];
-            s.read_exact(&mut resp).await.is_ok() && resp[1] == 0x00
+            if s.read_exact(&mut resp).await.is_err() || resp[1] != 0x00 { return false; }
+            // The engine acknowledges CONNECT before the remote handshake.
+            // Verify actual bytes, not just that local acknowledgement.
+            if s.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n").await.is_err() { return false; }
+            let mut status = [0; 5];
+            s.read_exact(&mut status).await.is_ok() && &status == b"HTTP/"
+          }).await.unwrap_or(false)
+           } => result,
+          }
         });
         if !probe {
             anyhow::bail!("proxy self-test failed — could not open a test flow through the server");
         }
+
+        let report = runtime
+            .block_on(async {
+                tokio::select! {
+                    _ = wait_for_cancel(self.inner.stop_flag.clone()) => None,
+                    report = crate::geodata::refresh_before_proxy(backend_addr, |detail| {
+                        self.set_phase(EnginePhase::Connecting { detail });
+                    }) => Some(report),
+                }
+            })
+            .context("Connection cancelled")?;
+        send_event(EngineEvent::GeoDataStatus {
+            description: report.description(),
+            warning: report.warning.is_some(),
+        });
+        let router = crate::routing::Router::for_profile(profile)
+            .context("invalid proxy routing rules")?
+            .with_tunnel_dns(backend_addr, &profile.dns_servers)?;
+        let mixed = runtime.block_on(crate::proxy::MixedProxy::start(
+            listen,
+            backend_addr,
+            router,
+        ))?;
+        let local_addr = mixed.local_addr;
 
         // Persist the running pieces for teardown.
         *self.inner.connected_at.lock().unwrap() = Some(Instant::now());
         let mut teardown = Teardown::default();
         teardown.runtime = Some(runtime);
         teardown.proxy = Some(ProxyTeardown {
+            mixed,
             socks: handle,
             flow_task: flow_task.abort_handle(),
             udp_task: udp_task.abort_handle(),
         });
         *self.inner.teardown.lock().unwrap() = Some(teardown);
+        anyhow::ensure!(
+            !self.inner.stop_flag.load(Ordering::SeqCst),
+            "Connection cancelled"
+        );
 
         if profile.server_identity_pin.is_none() {
             send_event(EngineEvent::TofuCaptured {
@@ -414,24 +474,17 @@ impl EngineHandle {
             });
         }
 
-        // Route the system through the proxy (browsers follow WinINET).
-        // Best-effort: without it the user must configure apps by hand.
-        if let Err(e) = crate::sysproxy::set_system_proxy("127.0.0.1", profile.proxy_port) {
-            tracing::warn!(error = %format!("{e:#}"), "could not set the system proxy");
-            send_event(EngineEvent::Notice(
-                "Could not set the system proxy — configure your browser to \
-                 socks5://127.0.0.1:<port> manually."
-                    .into(),
-            ));
-        }
+        // Do not report Connected until Windows points at the live listener.
+        crate::sysproxy::set_system_proxy("127.0.0.1", profile.proxy_port)
+            .context("Cannot enable Windows system proxy")?;
 
         self.set_phase(EnginePhase::Connected {
-            ip: format!("socks5://{local_addr}"),
+            ip: format!("http/socks5://{local_addr}"),
             gateway: "bypass rules active".into(),
             server: profile.server_address.clone(),
         });
         send_event(EngineEvent::Notice(format!(
-            "SOCKS5 proxy on {local_addr} — the system proxy is set to it (bypass rules applied)"
+            "HTTP/SOCKS proxy on {local_addr} — ordered routing rules active; reconnect after editing rules"
         )));
         Ok(())
     }
@@ -473,6 +526,12 @@ impl EngineHandle {
 
     /// Ask for teardown. Returns immediately; `Stopped` arrives via events.
     pub fn stop(&self) {
+        if self.inner.torn_down.load(Ordering::SeqCst)
+            || self.inner.stop_requested.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.inner.stop_flag.store(true, Ordering::SeqCst);
         self.set_phase(EnginePhase::Stopping);
         let inner = self.inner.clone();
         std::thread::Builder::new()
@@ -488,6 +547,20 @@ impl EngineHandle {
     fn teardown(&self) {
         teardown_inner(&self.inner);
         *self.inner.phase.lock().unwrap() = EnginePhase::Idle;
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        *self.inner.teardown_done.0.lock().unwrap()
+    }
+
+    /// Exit fallback: never let the process disappear while cleanup is running.
+    pub fn stop_and_wait(&self) {
+        self.teardown();
+        let (done, wake) = &self.inner.teardown_done;
+        let mut done = done.lock().unwrap();
+        while !*done {
+            done = wake.wait(done).unwrap();
+        }
     }
 
     fn run_connect(&self, profile: &Profile) -> Result<()> {
@@ -527,7 +600,9 @@ impl EngineHandle {
             .context("failed to create the engine runtime")?;
 
         // ---- 3. Engine client — the TOFU check happens here ---------------------
-        self.set_phase(EnginePhase::Connecting { detail: "handshaking".into() });
+        self.set_phase(EnginePhase::Connecting {
+            detail: "handshaking".into(),
+        });
         let client = match IosTunClient::new(&config, runtime.handle().clone()) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -550,24 +625,32 @@ impl EngineHandle {
         let dns_task = {
             let c = client.clone();
             runtime.spawn(async move {
-                if let Err(e) = rvpn_mobile::ios_tun_ffi::start_dns_proxy_for_direct_tun(&c).await
-                {
+                if let Err(e) = rvpn_mobile::ios_tun_ffi::start_dns_proxy_for_direct_tun(&c).await {
                     tracing::error!(error = %e, "DNS proxy exited");
                 }
             })
         };
 
         // ---- 5. Wintun adapter ----------------------------------------------------
-        self.set_phase(EnginePhase::Connecting { detail: "creating adapter".into() });
+        self.set_phase(EnginePhase::Connecting {
+            detail: "creating adapter".into(),
+        });
         let device = Arc::new(TunDevice::create(profile.mtu)?);
 
         // ---- 6. Start the engine and wait for the virtual IP ----------------------
-        self.set_phase(EnginePhase::Connecting { detail: "connecting".into() });
+        self.set_phase(EnginePhase::Connecting {
+            detail: "connecting".into(),
+        });
         client.set_reconnect_enabled(true);
         client.start();
 
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            if self.inner.stop_flag.load(Ordering::SeqCst) {
+                client.set_reconnect_enabled(false);
+                client.stop();
+                anyhow::bail!("Connection cancelled");
+            }
             match client.get_state() {
                 TunClientState::Connected | TunClientState::IpAssigned => break,
                 TunClientState::Error => anyhow::bail!("engine entered an error state"),
@@ -589,7 +672,9 @@ impl EngineHandle {
             .unwrap_or_else(|| winroute::derive_gateway(ip));
 
         // ---- 7. Windows plumbing ---------------------------------------------------
-        self.set_phase(EnginePhase::Connecting { detail: "configuring routes".into() });
+        self.set_phase(EnginePhase::Connecting {
+            detail: "configuring routes".into(),
+        });
         let original_route = winroute::capture_default_route()?;
         device
             .configure_address(ip, winroute::TUNNEL_NETMASK)
@@ -605,8 +690,13 @@ impl EngineHandle {
                 }
             }
         }
-        winroute::install_routes(winroute::ADAPTER_NAME, gateway, &original_route, &bypass_cidrs)
-            .context("failed to install tunnel routes")?;
+        winroute::install_routes(
+            winroute::ADAPTER_NAME,
+            gateway,
+            &original_route,
+            &bypass_cidrs,
+        )
+        .context("failed to install tunnel routes")?;
 
         // DNS strategy: the loopback DoH proxy needs UDP 127.0.0.1:53. Local
         // DNS tools (e.g. Shecan/nextdns) often hold that port — routing the
@@ -669,6 +759,10 @@ impl EngineHandle {
         flow.device = Some(device);
         flow.routes = routes;
         *self.inner.teardown.lock().unwrap() = Some(flow);
+        anyhow::ensure!(
+            !self.inner.stop_flag.load(Ordering::SeqCst),
+            "Connection cancelled"
+        );
         self.set_phase(EnginePhase::Connected {
             ip: ip.to_string(),
             gateway: gateway.to_string(),
@@ -786,11 +880,25 @@ impl EngineHandle {
     }
 }
 
+async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn teardown_inner(inner: &EngineInner) {
     if inner.torn_down.swap(true, Ordering::SeqCst) {
         return;
     }
     inner.stop_flag.store(true, Ordering::SeqCst);
+    struct Complete<'a>(&'a EngineInner);
+    impl Drop for Complete<'_> {
+        fn drop(&mut self) {
+            *self.0.teardown_done.0.lock().unwrap() = true;
+            self.0.teardown_done.1.notify_all();
+        }
+    }
+    let _complete = Complete(inner);
 
     let teardown = inner.teardown.lock().unwrap().take();
     let Some(mut t) = teardown else {
@@ -805,13 +913,16 @@ fn teardown_inner(inner: &EngineInner) {
     // Proxy mode: stop the SOCKS5 listener and the flow pump, restore the
     // system proxy, then the runtime drops below.
     if let Some(proxy) = t.proxy.take() {
+        // Restore first, while the listener is still alive and before any
+        // potentially slow task/runtime shutdown.
+        crate::sysproxy::restore_system_proxy();
+        drop(proxy.mixed);
         if let Some(rt) = t.runtime.as_ref() {
             rt.block_on(proxy.socks.stop());
         }
         proxy.flow_task.abort();
         proxy.udp_task.abort();
         t.runtime = None;
-        crate::sysproxy::restore_system_proxy();
         tracing::info!("proxy mode teardown complete");
         return;
     }
@@ -872,6 +983,68 @@ pub(crate) fn for_each_packet(batch: &[u8], mut f: impl FnMut(&[u8])) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_startup_never_reports_a_connection_failure() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let profile = Profile::new("cancelled-isolated-test");
+        let handle =
+            EngineHandle::connect_cancellable(&profile, tx, Arc::new(AtomicBool::new(true)));
+        assert_eq!(handle.snapshot().phase, EnginePhase::Idle);
+        assert!(handle.is_stopped());
+    }
+
+    #[test]
+    fn shutdown_waits_for_cleanup_instead_of_only_the_stop_flag() {
+        let handle = EngineHandle {
+            inner: Arc::new(EngineInner {
+                phase: Mutex::new(EnginePhase::Connected {
+                    ip: "test".into(),
+                    gateway: "test".into(),
+                    server: "test".into(),
+                }),
+                stop_flag: Arc::new(AtomicBool::new(false)),
+                rx_bytes: Arc::new(AtomicU64::new(0)),
+                tx_bytes: Arc::new(AtomicU64::new(0)),
+                connected_at: Mutex::new(None),
+                teardown: Mutex::new(None),
+                pumps: Mutex::new(vec![]),
+                torn_down: AtomicBool::new(false),
+                stop_requested: AtomicBool::new(false),
+                teardown_done: (Mutex::new(false), std::sync::Condvar::new()),
+            }),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let pump_barrier = barrier.clone();
+        handle
+            .inner
+            .pumps
+            .lock()
+            .unwrap()
+            .push(std::thread::spawn(move || {
+                pump_barrier.wait();
+            }));
+        handle.stop();
+        handle.stop();
+        while !handle.inner.torn_down.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        assert!(
+            !handle.is_stopped(),
+            "teardown has started but the pump is still running"
+        );
+        let waiter = handle.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            waiter.stop_and_wait();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        barrier.wait();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker.join().unwrap();
+        assert!(handle.is_stopped());
+    }
 
     #[test]
     fn phase_is_cloneable_and_matchable() {

@@ -94,10 +94,14 @@ impl Tray {
             .build()?;
 
         // Menu events arrive on muda's global channel; forward to ours.
+        // The window-showing actions ALSO raise the window directly here:
+        // while the window is hidden the egui loop may be stalled, so a
+        // queued command alone might never be processed.
         let menu_tx = tx.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             match event.id().as_ref() {
                 "show" => {
+                    crate::platform::show_main_window();
                     let _ = menu_tx.send(TrayCommand::ShowWindow);
                 }
                 "toggle" => {
@@ -110,11 +114,13 @@ impl Tray {
             }
         }));
 
-        // Tray events (clicks) — left click opens the window.
+        // Tray events (clicks) — left click opens the window (direct Win32,
+        // independent of the egui repaint loop).
         let tray_tx = tx.clone();
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
             if let TrayIconEvent::Click { button: tray_icon::MouseButton::Left, button_state: tray_icon::MouseButtonState::Up, .. } = event
             {
+                crate::platform::show_main_window();
                 let _ = tray_tx.send(TrayCommand::ShowWindow);
             }
         }));
