@@ -260,3 +260,78 @@ fn proxy_mode_socks4_system_dialect() {
     assert_ne!(ip, "127.0.0.1");
     println!("E2E SOCKS4 PASS — system dialect exits via {ip}");
 }
+
+#[test]
+#[ignore = "needs a live rVPN server"]
+fn proxy_counters_are_cumulative() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_target(false)
+        .try_init();
+
+    // Skip when the user's running GUI owns the system proxy (its backup
+    // guard / cleanup helper would reject a second session).
+    if rvpn_windows::paths::app_data_dir()
+        .join("sysproxy-backup.json")
+        .exists()
+    {
+        eprintln!("SKIP: another proxy session is active");
+        return;
+    }
+
+    let mut profile = Profile::new("proxy e2e counters");
+    let pdir = rvpn_windows::paths::profile_dir(&profile.slug);
+    std::fs::create_dir_all(&pdir).unwrap();
+    rvpn_windows::identity::generate_identity(&pdir.join("identity.key")).unwrap();
+    std::fs::write(
+        pdir.join("prekey-bundle.json"),
+        include_str!("../../../assets/dl99aa-prekey.json"),
+    )
+    .unwrap();
+
+    let port = pick_free_port();
+    profile.mode = ConnMode::Proxy;
+    profile.proxy_port = port;
+    profile.server_address = server_address();
+
+    let (tx, rx) = mpsc::channel::<EngineEvent>();
+    let connect_handle = std::thread::spawn(move || EngineHandle::connect(&profile, tx));
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        match rx.try_recv() {
+            Ok(EngineEvent::Phase(EnginePhase::Connected { .. })) => break,
+            Ok(EngineEvent::Phase(EnginePhase::Failed { reason })) => {
+                panic!("proxy connect failed: {reason}")
+            }
+            Ok(_) => {}
+            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            _ => panic!("proxy mode did not reach Connected"),
+        }
+    }
+    let engine = connect_handle.join().unwrap();
+
+    // Two sequential tunnelled requests; the session counters must GROW
+    // across them, not reset per request.
+    let _ = socks5_http_get(port, "api.ipify.org", "/");
+    std::thread::sleep(Duration::from_millis(300));
+    let snap1 = engine.snapshot();
+    assert!(snap1.rx_bytes > 0 && snap1.tx_bytes > 0, "counters at zero after first request");
+
+    let _ = socks5_http_get(port, "example.com", "/");
+    std::thread::sleep(Duration::from_millis(300));
+    let snap2 = engine.snapshot();
+
+    engine.stop();
+    assert!(
+        snap2.rx_bytes > snap1.rx_bytes && snap2.tx_bytes > snap1.tx_bytes,
+        "counters are not cumulative: after1 rx={} tx={} / after2 rx={} tx={}",
+        snap1.rx_bytes, snap1.tx_bytes, snap2.rx_bytes, snap2.tx_bytes
+    );
+    println!(
+        "COUNTERS PASS — cumulative session totals: up {} B, down {} B",
+        snap2.tx_bytes, snap2.rx_bytes
+    );
+}

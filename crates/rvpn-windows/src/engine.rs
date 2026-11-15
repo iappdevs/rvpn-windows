@@ -344,14 +344,7 @@ impl EngineHandle {
                             None => (addr.clone(), 80),
                         };
                         let host = host.trim_matches(['[', ']']);
-                        let counters = {
-                            let rx = rx.clone();
-                            let tx = tx.clone();
-                            move |up: u64, down: u64| {
-                                tx.store(up, Ordering::Relaxed);
-                                rx.store(down, Ordering::Relaxed);
-                            }
-                        };
+                        let counters = make_delta_counter(rx, tx);
                         let result = rvpn_mobile::flow_connector::relay_flow(
                             &cfg,
                             host,
@@ -964,6 +957,23 @@ fn join_pumps(inner: &EngineInner) {
     }
 }
 
+/// Build the per-flow byte counter that converts `relay_flow`'s CUMULATIVE
+/// per-flow up/down reports into deltas and adds them into the SESSION
+/// totals — every request contributes; no flow ever overwrites the totals.
+pub(crate) fn make_delta_counter(
+    rx: Arc<AtomicU64>,
+    tx: Arc<AtomicU64>,
+) -> impl Fn(u64, u64) + Send + Sync + 'static {
+    let last_up = Arc::new(AtomicU64::new(0));
+    let last_down = Arc::new(AtomicU64::new(0));
+    move |up: u64, down: u64| {
+        let prev_up = last_up.swap(up, Ordering::Relaxed);
+        let prev_down = last_down.swap(down, Ordering::Relaxed);
+        tx.fetch_add(up.saturating_sub(prev_up), Ordering::Relaxed);
+        rx.fetch_add(down.saturating_sub(prev_down), Ordering::Relaxed);
+    }
+}
+
 /// Iterate the `[u16-LE length][raw IP packet]` entries of a downlink batch.
 /// Malformed tails are skipped defensively (never panic in the pump thread).
 pub(crate) fn for_each_packet(batch: &[u8], mut f: impl FnMut(&[u8])) {
@@ -983,6 +993,34 @@ pub(crate) fn for_each_packet(batch: &[u8], mut f: impl FnMut(&[u8])) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_counters_accumulate_across_flows() {
+        // Three independent flows (each reporting its own cumulative totals,
+        // as relay_flow does) must SUM into the session counters — the
+        // second flow starting from zero again must not reset them.
+        let rx = Arc::new(AtomicU64::new(0));
+        let tx = Arc::new(AtomicU64::new(0));
+
+        let flow1 = make_delta_counter(rx.clone(), tx.clone());
+        flow1(100, 500);
+        flow1(150, 900); // flow1 totals: up 150, down 900
+
+        let after_flow1 = (tx.load(Ordering::Relaxed), rx.load(Ordering::Relaxed));
+        assert_eq!(after_flow1, (150, 900));
+
+        let flow2 = make_delta_counter(rx.clone(), tx.clone());
+        flow2(50, 2000); // a NEW flow restarts from its own zero — must ADD
+        let after_flow2 = (tx.load(Ordering::Relaxed), rx.load(Ordering::Relaxed));
+        assert_eq!(after_flow2, (200, 2900));
+
+        let flow3 = make_delta_counter(rx.clone(), tx.clone());
+        flow3(10, 10);
+        assert_eq!(
+            (tx.load(Ordering::Relaxed), rx.load(Ordering::Relaxed)),
+            (210, 2910)
+        );
+    }
 
     #[test]
     fn cancelled_startup_never_reports_a_connection_failure() {
