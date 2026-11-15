@@ -189,7 +189,10 @@ fn main_window_handle() -> windows_sys::Win32::Foundation::HWND {
     MAIN_HWND.load(AtomicOrdering::SeqCst) as windows_sys::Win32::Foundation::HWND
 }
 
-/// Bring the main window up from the tray (no-op if already visible).
+/// Bring the main window up from the tray AND take the foreground — for
+/// ONE-SHOT, user-driven events only (tray click, Open menu). Calling this
+/// repeatedly while another app has focus makes Windows deny the switch and
+/// flash the taskbar button orange instead.
 pub fn show_main_window() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
@@ -203,6 +206,24 @@ pub fn show_main_window() {
             ShowWindow(hwnd, if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
         }
         let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Make sure the main window is visible WITHOUT touching the foreground.
+/// Safe to call every frame: when the window is already visible and another
+/// app holds focus, this does nothing (no orange taskbar flash).
+pub fn ensure_window_visible() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, IsWindowVisible, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+    let hwnd = main_window_handle();
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
+        }
     }
 }
 

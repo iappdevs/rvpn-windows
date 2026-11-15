@@ -335,7 +335,10 @@ impl RvpnApp {
             // window is hidden, leaving a Visible(true) forever unprocessed.
             crate::platform::hide_main_window();
         } else {
-            crate::platform::show_main_window();
+            // Visible-check only — NEVER SetForegroundWindow here: a per-frame
+            // foreground grab while another app holds focus gets denied and
+            // flashes our taskbar button orange.
+            crate::platform::ensure_window_visible();
         }
         if self.force_quit && self.shutdown_complete() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
