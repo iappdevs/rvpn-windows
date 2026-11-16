@@ -344,15 +344,14 @@ impl EngineHandle {
                             None => (addr.clone(), 80),
                         };
                         let host = host.trim_matches(['[', ']']);
+                        let host = host.to_string();
                         let counters = make_delta_counter(rx, tx);
-                        let result = rvpn_mobile::flow_connector::relay_flow(
-                            &cfg,
-                            host,
-                            port,
-                            &mut socket,
-                            &counters,
-                        )
-                        .await;
+                        // Transient link resets (RST bursts on the Iran↔server
+                        // path) kill brand-new handshakes; a short retry turns
+                        // most of them into a 400 ms hiccup instead of a
+                        // browser error page. Only retried while nothing has
+                        // been relayed yet — a mid-stream failure is real.
+                        let mut result = relay_flow_with_retry(&cfg, &host, port, &mut socket, &counters).await;
                         if let Err(e) = &result {
                             tracing::debug!(error = %format!("{e:#}"), "flow ended with error");
                         }
@@ -971,6 +970,46 @@ pub(crate) fn make_delta_counter(
         let prev_down = last_down.swap(down, Ordering::Relaxed);
         tx.fetch_add(up.saturating_sub(prev_up), Ordering::Relaxed);
         rx.fetch_add(down.saturating_sub(prev_down), Ordering::Relaxed);
+    }
+}
+
+/// `relay_flow` with up to two extra attempts while NOTHING has been
+/// relayed yet (fresh handshakes killed by transient link resets — common
+/// RST bursts on long-haul paths). Once any byte has flowed, a failure is
+/// reported as-is: retrying a mid-stream break would corrupt the flow.
+async fn relay_flow_with_retry<S>(
+    cfg: &rvpn_mobile::flow_connector::FlowConnectorConfig,
+    host: &str,
+    port: u16,
+    socket: &mut S,
+    counters: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        let relayed_any = Arc::new(AtomicBool::new(false));
+        let flagged = {
+            let relayed_any = relayed_any.clone();
+            move |up: u64, down: u64| {
+                if up > 0 || down > 0 {
+                    relayed_any.store(true, Ordering::Relaxed);
+                }
+                counters(up, down);
+            }
+        };
+        match rvpn_mobile::flow_connector::relay_flow(cfg, host, port, socket, &flagged).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if relayed_any.load(Ordering::Relaxed) || attempt >= 2 {
+                    return Err(e);
+                }
+                attempt += 1;
+                tracing::debug!(attempt, error = %format!("{e:#}"), "transient flow failure — retrying");
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            }
+        }
     }
 }
 
