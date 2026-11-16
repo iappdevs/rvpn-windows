@@ -351,7 +351,7 @@ impl EngineHandle {
                         // most of them into a 400 ms hiccup instead of a
                         // browser error page. Only retried while nothing has
                         // been relayed yet — a mid-stream failure is real.
-                        let mut result = relay_flow_with_retry(&cfg, &host, port, &mut socket, &counters).await;
+                        let result = relay_flow_with_retry(&cfg, &host, port, &mut socket, &counters).await;
                         if let Err(e) = &result {
                             tracing::debug!(error = %format!("{e:#}"), "flow ended with error");
                         }
