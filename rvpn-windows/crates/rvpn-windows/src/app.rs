@@ -28,6 +28,26 @@ enum View {
     Logs,
 }
 
+/// Background messages from the update worker.
+enum UpdateMsg {
+    Info(crate::updater::ReleaseInfo),
+    Failed(String),
+    /// Download+install finished; carry the new exe to relaunch on quit.
+    Installed(std::path::PathBuf),
+}
+
+#[derive(Default, Clone)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    Available(Box<crate::updater::ReleaseInfo>),
+    Downloading,
+    /// Installed; quit in progress, relaunch fires on shutdown-complete.
+    RelaunchOnQuit(std::path::PathBuf),
+    Failed(String),
+}
+
 /// A file-picker request in flight (rfd runs off-thread).
 struct Picker {
     purpose: PickerPurpose,
@@ -74,6 +94,12 @@ pub struct RvpnApp {
     flash: Option<(String, std::time::Instant, Color32)>,
     force_quit: bool,
     show_window: bool,
+    /// Self-update state (checked in the background at launch).
+    update: UpdateState,
+    update_rx: Option<std::sync::mpsc::Receiver<UpdateMsg>>,
+    update_relaunched: bool,
+    /// After the launch check, further checks/failures are silent unless manual.
+    auto_update_silent: bool,
     editor_tab: usize,
     settings_tab: usize,
     log_filter: String,
@@ -120,6 +146,10 @@ impl RvpnApp {
             flash: None,
             force_quit: false,
             show_window: !start_minimized,
+            update: UpdateState::Idle,
+            update_rx: None,
+            update_relaunched: false,
+            auto_update_silent: false,
             editor_tab: 0,
             settings_tab: 0,
             log_filter: String::new(),
@@ -169,6 +199,229 @@ impl RvpnApp {
 
     fn flash(&mut self, msg: impl Into<String>, color: Color32) {
         self.flash = Some((msg.into(), std::time::Instant::now(), color));
+    }
+
+    /// The update card — shown on the Connect page when a new release is
+    /// available, and in Settings for a manual check.
+    fn update_card(&mut self, ui: &mut egui::Ui) {
+        match &self.update {
+            UpdateState::Available(info) => {
+                let info = info.clone();
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("⬆").size(18.0).color(ACCENT));
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(format!("Update available — {}", info.tag))
+                                    .strong(),
+                            );
+                            let notes: String = info
+                                .body
+                                .lines()
+                                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                                .take(4)
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            if !notes.is_empty() {
+                                ui.label(
+                                    RichText::new(notes)
+                                        .small()
+                                        .color(Color32::from_gray(140)),
+                                );
+                            }
+                        });
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Later").clicked() {
+                                self.update = UpdateState::Idle;
+                                self.auto_update_silent = true;
+                            }
+                            let btn = egui::Button::new(
+                                RichText::new("Update & restart").strong().color(Color32::BLACK),
+                            )
+                            .fill(ACCENT);
+                            if ui.add(btn).clicked() {
+                                self.start_update_install();
+                            }
+                        });
+                    });
+                });
+            }
+            UpdateState::Downloading => {
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Downloading update… the app restarts when it's ready.");
+                    });
+                });
+            }
+            UpdateState::RelaunchOnQuit(_) => {
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Update installed — restarting…");
+                    });
+                });
+            }
+            UpdateState::Failed(e) => {
+                let e = e.clone();
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Update failed").strong().color(DANGER));
+                            ui.label(RichText::new(e).small().color(Color32::from_gray(140)));
+                        });
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Retry").clicked() {
+                                self.update = UpdateState::Idle;
+                                self.auto_update_silent = true;
+                                self.start_update_check();
+                            }
+                        });
+                    });
+                });
+            }
+            UpdateState::Checking => {
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Checking for updates…");
+                    });
+                });
+            }
+            UpdateState::Idle => {
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Version {} — updates download from GitHub releases.",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .small()
+                            .color(Color32::from_gray(130)),
+                        );
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Check for updates").clicked() {
+                                self.auto_update_silent = false;
+                                self.start_update_check();
+                            }
+                        });
+                    });
+                });
+            }
+        }
+    }
+
+    // ---- self-update -----------------------------------------------------------
+
+    /// Kick off a background release check (skipped in debug builds and
+    /// while another one is running).
+    fn start_update_check(&mut self) {
+        if cfg!(debug_assertions)
+            || self.update_rx.is_some()
+            || !matches!(self.update, UpdateState::Idle)
+        {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<UpdateMsg>();
+        self.update_rx = Some(rx);
+        self.update = UpdateState::Checking;
+        std::thread::Builder::new()
+            .name("rvpn-update-check".into())
+            .spawn(move || {
+                // Let the UI (and the tunnel) come up first.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                match crate::updater::fetch_latest() {
+                    Ok(info) => {
+                        let _ = tx.send(UpdateMsg::Info(info));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(UpdateMsg::Failed(format!("{e:#}")));
+                    }
+                }
+            })
+            .expect("failed to spawn update check");
+    }
+
+    /// Non-blocking poll of the update worker + the auto-check trigger.
+    fn pump_update(&mut self) {
+        let Some(rx) = self.update_rx.take() else {
+            return;
+        };
+        {
+            let mut done = false;
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    UpdateMsg::Info(info) => {
+                        let newer = crate::updater::is_newer(
+                            &info.tag,
+                            env!("CARGO_PKG_VERSION"),
+                        );
+                        if newer {
+                            tracing::info!(tag = %info.tag, "update available");
+                            self.update = UpdateState::Available(Box::new(info));
+                        } else {
+                            self.update = UpdateState::Idle;
+                            if !self.auto_update_silent {
+                                self.flash("You are on the latest version", ACCENT);
+                            }
+                        }
+                        done = true;
+                    }
+                    UpdateMsg::Failed(e) => {
+                        tracing::debug!(error = %e, "update check failed");
+                        self.update = UpdateState::Idle;
+                        if !self.auto_update_silent {
+                            self.flash(format!("Update check failed: {e}"), WARN);
+                        }
+                        done = true;
+                    }
+                    UpdateMsg::Installed(path) => {
+                        // Files are in place; quit and relaunch at the end.
+                        self.update = UpdateState::RelaunchOnQuit(path);
+                        self.request_quit();
+                        done = true;
+                    }
+                }
+            }
+            if done {
+                self.update_rx = None;
+                self.auto_update_silent = true; // later checks are manual
+            }
+        }
+    }
+
+    /// Download + install the pending release in the background.
+    fn start_update_install(&mut self) {
+        let UpdateState::Available(info) = self.update.clone() else {
+            return;
+        };
+        self.update = UpdateState::Downloading;
+        let url = info.url.clone();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let Some(exe_dir) = exe_dir else {
+            self.update = UpdateState::Failed("cannot locate the app folder".into());
+            return;
+        };
+        let (tx, rx) = mpsc::channel::<UpdateMsg>();
+        self.update_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("rvpn-update-install".into())
+            .spawn(move || {
+                let msg = match crate::updater::download_and_install(&url, &exe_dir) {
+                    Ok(path) => UpdateMsg::Installed(path),
+                    Err(e) => UpdateMsg::Failed(format!("{e:#}")),
+                };
+                let _ = tx.send(msg);
+            })
+            .expect("failed to spawn update install");
     }
 
     fn selected(&self) -> Option<&Profile> {
@@ -230,6 +483,7 @@ impl RvpnApp {
     // ---- per-frame housekeeping -----------------------------------------------
 
     fn pump_background(&mut self, ctx: &egui::Context) {
+        self.pump_update();
         // Join before accepting the result. A panicked worker must not strand
         // the UI in Connecting or leave its Windows proxy behind.
         if self
@@ -341,6 +595,15 @@ impl RvpnApp {
             crate::platform::ensure_window_visible();
         }
         if self.force_quit && self.shutdown_complete() {
+            // Update installed: relaunch the new exe (elevated) right before exit.
+            if let UpdateState::RelaunchOnQuit(path) = &self.update {
+                if !self.update_relaunched {
+                    self.update_relaunched = true;
+                    if !crate::updater::relaunch(path) {
+                        tracing::error!("relaunch of the updated exe failed");
+                    }
+                }
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Window title reflects state.
@@ -648,6 +911,9 @@ impl eframe::App for RvpnApp {
         self.pump_background(ctx);
         self.poll_picker();
 
+        // One background release check per launch (release builds only).
+        self.start_update_check();
+
         self.render_shell(ctx);
 
         self.show_tofu_dialog(ctx);
@@ -725,6 +991,10 @@ impl RvpnApp {
             "Your connection",
             "Choose a profile and control how your traffic is routed.",
         );
+        if !matches!(self.update, UpdateState::Idle | UpdateState::Checking) {
+            self.update_card(ui);
+            ui.add_space(10.0);
+        }
         if self.selected().is_none() {
             design::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1255,6 +1525,9 @@ impl RvpnApp {
             }
         });
         ui.add_space(18.0);
+        if self.settings_tab == 0 {
+            self.update_card(ui);
+        }
         if self.settings_tab == 0 {
             let mut changed = false;
             design::card().show(ui, |ui| {
@@ -1787,6 +2060,10 @@ mod tests {
             force_quit: false,
             show_window: true,
             editor_tab: 0,
+            update: Default::default(),
+            update_rx: None,
+            update_relaunched: false,
+            auto_update_silent: true,
             settings_tab: 0,
             log_filter: String::new(),
             editor_buffers: Default::default(),
