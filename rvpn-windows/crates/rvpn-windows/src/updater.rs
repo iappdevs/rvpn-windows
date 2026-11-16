@@ -122,6 +122,7 @@ pub fn install_from(extracted: &Path, exe_dir: &Path) -> Result<PathBuf> {
 /// Full pipeline: download → extract → install. Returns the new exe path.
 pub fn download_and_install(url: &str, exe_dir: &Path) -> Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("rvpn-update-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).context("cannot create the update temp folder")?;
     let _guard = TempDirGuard(&tmp);
     let zip = tmp.join("update.zip");
     download(url, &zip)?;
@@ -187,8 +188,12 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn run_ps(script: &str) -> Result<String> {
+    // Force UTF-8 on the piped stdout: with the OEM codepage, non-ASCII
+    // characters in release notes turn into control bytes that break the
+    // JSON parse downstream.
+    let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}");
     let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .context("failed to spawn powershell")?;
     if !out.status.success() {
@@ -252,5 +257,30 @@ mod tests {
         assert!(info.tag.starts_with('v'), "tag={}", info.tag);
         assert!(info.url.contains("win64.zip"), "url={}", info.url);
         println!("latest: {} → {}", info.tag, info.url);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// Full real cycle against the live GitHub release: fetch → download →
+    /// extract → install into a scratch folder (with fake "running" files).
+    #[test]
+    #[ignore = "network + live GitHub release (downloads the real zip)"]
+    fn download_and_install_real_release() {
+        let info = fetch_latest().expect("fetch latest");
+        let dir = tempfile::tempdir().unwrap();
+        let exe_dir = dir.path().join("app");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join(APP_EXE_NAME), b"old-exe").unwrap();
+
+        let new_exe = download_and_install(&info.url, &exe_dir).expect("install");
+        assert!(new_exe.is_file());
+        let meta = std::fs::metadata(&new_exe).unwrap();
+        assert!(meta.len() > 1_000_000, "suspiciously small exe: {}", meta.len());
+        assert!(std::fs::read(exe_dir.join(format!("{APP_EXE_NAME}.old"))).unwrap() == b"old-exe");
+        assert!(exe_dir.join(WINTUN_NAME).is_file(), "wintun.dll not installed");
+        println!("cycle OK: {} ({} bytes) from {}", new_exe.display(), meta.len(), info.tag);
     }
 }
