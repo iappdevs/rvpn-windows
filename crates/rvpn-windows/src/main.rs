@@ -24,6 +24,8 @@ fn main() -> eframe::Result<()> {
     // and restore the system proxy if a proxy session died uncleanly.
     rvpn_windows::winroute::sweep_stale_state();
     rvpn_windows::sysproxy::sweep_stale_system_proxy();
+    // Sweep exe/dll leftovers from a previous self-update.
+    rvpn_windows::updater::cleanup_old();
     struct RestoreProxyOnExit;
     impl Drop for RestoreProxyOnExit {
         fn drop(&mut self) {

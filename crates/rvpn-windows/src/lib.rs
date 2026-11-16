@@ -15,6 +15,7 @@ mod routing_ui;
 pub mod proxy;
 mod tunnel_dns;
 pub mod sysproxy;
+pub mod updater;
 pub mod tray;
 pub mod tundevice;
 pub mod winroute;
