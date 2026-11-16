@@ -170,6 +170,10 @@ impl TunnelDns {
                 Ok(answer) => return Ok(answer),
                 Err(error) => last_error = Some(error),
             }
+            // Transient link resets (RST bursts) kill back-to-back attempts
+            // on separate connections just as easily; give the path a beat
+            // to recover before the next try.
+            tokio::time::sleep(Duration::from_millis(350)).await;
         }
         Err(last_error.unwrap()).context("DNS over the rVPN tunnel failed")
     }
