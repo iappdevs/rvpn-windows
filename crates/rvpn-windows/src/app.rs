@@ -201,6 +201,86 @@ impl RvpnApp {
         self.flash = Some((msg.into(), std::time::Instant::now(), color));
     }
 
+    /// Export the individual files a mobile rVPN app needs (Android / iOS /
+    /// macOS): the prekey bundle JSON and optionally the identity key,
+    /// alongside a step-by-step instructions file. The .rvpn container is
+    /// Windows-specific; these raw files are what the mobile profile editor
+    /// consumes directly.
+    fn share_for_mobile(&mut self, profile: &Profile) {
+        let dir = rfd::FileDialog::new()
+            .set_title("Choose where to save the mobile files")
+            .save_file();
+
+        let Some(target) = dir else { return };
+        let target = if target.extension().is_some() {
+            target
+        } else {
+            target.with_extension("") // treat as directory
+        };
+        let folder = target.with_file_name(format!("{}-mobile", profile.slug));
+        if let Err(e) = std::fs::create_dir_all(&folder) {
+            self.flash(format!("Cannot create folder: {e}"), DANGER);
+            return;
+        }
+
+        // 1. Prekey bundle — universal JSON, identical format on all platforms.
+        let prekey_src = profile.prekey_path();
+        let prekey = match std::fs::read_to_string(&prekey_src) {
+            Ok(p) => p,
+            Err(e) => {
+                self.flash(format!("Cannot read prekey bundle: {e}"), DANGER);
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(folder.join("prekey-bundle.json"), &prekey) {
+            self.flash(format!("Cannot write prekey: {e}"), DANGER);
+            return;
+        }
+
+        // 2. Identity key (optional — the mobile app can generate its own).
+        let identity_copied = profile
+            .identity_path()
+            .is_file()
+            .then(|| std::fs::copy(profile.identity_path(), folder.join("identity.key")).is_ok())
+            .unwrap_or(false);
+
+        // 3. Instructions.
+        let instructions = format!(
+            "R-VPN Mobile Setup — {}\n\
+             ================================\n\n\
+             Send these files to your phone (Telegram, email, cloud drive…), then:\n\n\
+             ANDROID / iOS:\n\
+             1. Open the R-VPN app\n\
+             2. Tap + to create a profile\n\
+             3. Server Address: {}\n\
+             4. Tap 'Import Prekey' and select prekey-bundle.json\n\
+             5. Tap 'Generate Identity' (creates a new key for this device)\n\
+             6. Save and connect\n\n\
+             OPTIONAL — reuse this device's identity:\n\
+             Instead of Generate, import the identity.key file.\n\
+             (Each device normally generates its own identity; sharing is safe\n\
+             but means both devices present the same public key.)\n\n\
+             macOS:\n\
+             Profiles → Import .rvpn if you have one, or use the same manual steps.\n\n\
+             Server pin (TOFU): {}\n\
+             This is the server's identity fingerprint. On first connect the app\n\
+             captures it automatically. If you ever see a different pin, the server\n\
+             may have been replaced — verify before trusting.\n",
+            profile.name,
+            profile.server_address,
+            profile.server_identity_pin.as_deref().unwrap_or("(not pinned yet)"),
+        );
+        let _ = std::fs::write(folder.join("README.txt"), instructions);
+
+        self.flash(
+            format!(
+                "Mobile files saved to {} — send them to your phone",
+                folder.display()
+            ),
+            ACCENT,
+        );
+    }
+
     /// The update card — shown on the Connect page when a new release is
     /// available, and in Settings for a manual check.
     fn update_card(&mut self, ui: &mut egui::Ui) {
@@ -1443,6 +1523,10 @@ impl RvpnApp {
                                             self.flash(format!("Export failed: {error}"), DANGER)
                                         }
                                     }
+                                    ui.close_menu();
+                                }
+                                if ui.button("Share for mobile…").clicked() {
+                                    self.share_for_mobile(&p);
                                     ui.close_menu();
                                 }
                                 if ui
