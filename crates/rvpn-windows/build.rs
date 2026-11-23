@@ -14,7 +14,14 @@ fn main() {
     }
     let mut res = winres::WindowsResource::new();
     res.set_manifest(include_str!("resources/app.manifest"));
+    // The application icon, drawn by scripts/make_icon.py. Absolute: build
+    // scripts run from the package directory.
+    let icon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../../assets/app.ico");
+    res.set_icon(&icon.to_string_lossy());
     if let Err(e) = res.compile() {
-        println!("cargo::warning=winres compile failed: {e}");
+        // A missing manifest means the app runs without the Administrator
+        // rights Wintun and the route table need — never ship that quietly.
+        panic!("winres compile failed: {e}");
     }
 }

@@ -75,5 +75,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [package.metadata.winres]
 FileDescription = "R-VPN Client for Windows"
-ProductName = "rvpn-windows"
+ProductName = "R-VPN"
+InternalName = "rvpn-windows"
+OriginalFilename = "rvpn-windows.exe"
 LegalCopyright = "Copyright (C) 2026. AGPL-3.0-or-later"

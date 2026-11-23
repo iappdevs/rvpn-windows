@@ -83,8 +83,8 @@ fn style(cc: &eframe::CreationContext<'_>) {
 }
 
 fn window_icon() -> egui::IconData {
-    // Same procedural shield as the tray icon, in the connected-green accent.
-    let (rgba, w, h) = rvpn_windows::tray::icon_rgba([46, 184, 114]);
+    // Same logo as the tray icon, in the connected-green accent.
+    let (rgba, w, h) = rvpn_windows::tray::icon_rgba([46, 184, 114], rvpn_windows::tray::WINDOW_ICON_SIZE);
     egui::IconData {
         rgba,
         width: w,
