@@ -13,6 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
@@ -59,7 +61,7 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
 pub fn fetch_latest() -> Result<ReleaseInfo> {
     let script = format!(
         "$ProgressPreference='SilentlyContinue'; \
-         (Invoke-RestMethod '{RELEASES_API}' -TimeoutSec 25) \
+         (Invoke-RestMethod '{RELEASES_API}' -TimeoutSec 20) \
          | Select-Object tag_name, body, \
              @{{n='url';e={{($_.assets | Where-Object name -like '*win64.zip' | \
                Select-Object -First 1).browser_download_url}}}} \
@@ -188,14 +190,44 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn run_ps(script: &str) -> Result<String> {
+    run_ps_with_timeout(script, Duration::from_secs(45))
+}
+
+/// Run PowerShell with a hard watchdog.
+///
+/// `-TimeoutSec` only bounds the HTTP request itself; on filtered networks
+/// PowerShell can still hang for minutes inside proxy auto-discovery (WPAD)
+/// or DNS before the request even starts, leaving the update check stuck on
+/// "Checking for updates…" forever. The watchdog kills the process at the
+/// deadline so the caller always gets an answer.
+fn run_ps_with_timeout(script: &str, timeout: Duration) -> Result<String> {
     // Force UTF-8 on the piped stdout: with the OEM codepage, non-ASCII
     // characters in release notes turn into control bytes that break the
     // JSON parse downstream.
     let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}");
-    let out = std::process::Command::new("powershell")
+    let mut child = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("failed to spawn powershell")?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("powershell timed out after {}s", timeout.as_secs());
+            }
+            None => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+
+    let out = child
+        .wait_with_output()
+        .context("failed to collect powershell output")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         bail!("powershell failed: {}", if err.is_empty() { out.status.to_string() } else { err });
