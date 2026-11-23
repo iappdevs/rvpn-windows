@@ -562,17 +562,30 @@ impl EngineHandle {
         let mut flow = Teardown::default();
 
         // ---- 1. Engine config ---------------------------------------------------
+        // The v2rayN-style routing rules apply in BOTH modes: in TUN mode the
+        // Direct rules compile into bypass routes (GeoIP countries + CIDRs)
+        // and the engine's split lists, so e.g. `geoip:ir` stays off the
+        // tunnel here too. Legacy profile fields are folded into the rules
+        // by `RoutingConfig::from_profile`.
+        let split = crate::routing::RoutingConfig::from_profile(profile).tunnel_split();
+        tracing::info!(
+            countries = ?split.countries,
+            networks = split.networks.len(),
+            bypass_domains = split.bypass_domains.len(),
+            tunnel_domains = split.tunnel_domains.len(),
+            "routing rules compiled for full tunnel"
+        );
         let config = TunConfig {
             server_address: profile.server_address.clone(),
             identity_key_path: profile.identity_path().to_string_lossy().into_owned(),
             prekey_bundle_path: profile.prekey_path().to_string_lossy().into_owned(),
             dns_servers: profile.dns_servers.clone(),
-            bypass_networks: profile.bypass_networks.clone(),
+            bypass_networks: split.networks.clone(),
             mtu: profile.mtu,
-            split_tunnel_enabled: profile.split_tunnel_enabled,
-            builtin_bypass_countries: profile.builtin_bypass_countries.clone(),
-            bypass_domains: profile.bypass_domains.clone(),
-            tunnel_domains: profile.tunnel_domains.clone(),
+            split_tunnel_enabled: !split.countries.is_empty() || !split.networks.is_empty(),
+            builtin_bypass_countries: split.countries.clone(),
+            bypass_domains: split.bypass_domains.clone(),
+            tunnel_domains: split.tunnel_domains.clone(),
             block_ads: profile.block_ads,
             dns_bind_addr: "127.0.0.1:53".into(),
             enable_dns_proxy: true,
@@ -672,14 +685,12 @@ impl EngineHandle {
             .configure_address(ip, winroute::TUNNEL_NETMASK)
             .context("failed to configure the tunnel interface")?;
 
-        let mut bypass_cidrs: Vec<String> = profile.bypass_networks.clone();
-        if profile.split_tunnel_enabled {
-            for country in &profile.builtin_bypass_countries {
-                if let Some(cidrs) = rvpn_mobile::rvpn_split_tunnel::get_country_ips(country) {
-                    bypass_cidrs.extend(cidrs.iter().map(|s| s.to_string()));
-                } else {
-                    tracing::warn!(country, "unknown bypass country code");
-                }
+        let mut bypass_cidrs: Vec<String> = split.networks.clone();
+        for country in &split.countries {
+            if let Some(cidrs) = rvpn_mobile::rvpn_split_tunnel::get_country_ips(country) {
+                bypass_cidrs.extend(cidrs.iter().map(|s| s.to_string()));
+            } else {
+                tracing::warn!(country, "unknown bypass country code");
             }
         }
         winroute::install_routes(

@@ -145,6 +145,68 @@ fn legacy_domains(domains: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Compiled form of the routing rules for full-tunnel (TUN) mode.
+///
+/// TUN routing happens in the OS route table, so only address-shaped rules
+/// can steer it: country codes (GeoIP) and CIDRs become bypass routes next
+/// to the engine's builtin LAN bypass. Domain lists ride along for the
+/// engine's DNS layer and apply fully in proxy mode. `geoip:private` is
+/// skipped — the builtin LAN bypass already covers RFC1918.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TunnelSplit {
+    /// GeoIP country codes whose traffic bypasses the tunnel (e.g. `IR`).
+    pub countries: Vec<String>,
+    /// CIDRs routed outside the tunnel.
+    pub networks: Vec<String>,
+    /// Domains routed outside the tunnel (engine suffix/`*.` form).
+    pub bypass_domains: Vec<String>,
+    /// Domains forced through the tunnel even when other rules bypass.
+    pub tunnel_domains: Vec<String>,
+}
+
+impl RoutingConfig {
+    /// Compile the enabled rules into the engine's tunnel-mode fields.
+    pub fn tunnel_split(&self) -> TunnelSplit {
+        let mut split = TunnelSplit::default();
+        for rule in self.rules.iter().filter(|r| r.enabled) {
+            for pattern in &rule.ips {
+                let pattern = pattern.trim();
+                if let Some(code) = pattern.strip_prefix("geoip:") {
+                    let code = code.trim().to_ascii_uppercase();
+                    if code == "PRIVATE" {
+                        continue; // builtin LAN bypass already covers it
+                    }
+                    if !code.is_empty() && !split.countries.contains(&code) {
+                        split.countries.push(code);
+                    }
+                } else if let Ok(net) = pattern.parse::<IpNetwork>() {
+                    let net = net.to_string();
+                    if !split.networks.contains(&net) {
+                        split.networks.push(net);
+                    }
+                }
+            }
+            let sink = match rule.outbound {
+                Outbound::Direct => &mut split.bypass_domains,
+                Outbound::Proxy => &mut split.tunnel_domains,
+                // The engine's TUN blocklist is ads-only today; Block rules
+                // keep applying in proxy mode and via ad blocking.
+                Outbound::Block => continue,
+            };
+            for domain in &rule.domains {
+                // Rule form (`domain:x`) back to the engine's plain-suffix
+                // form; wildcards pass through untouched.
+                let d = domain.trim();
+                let d = d.strip_prefix("domain:").unwrap_or(d);
+                if !d.is_empty() && !sink.iter().any(|e| e == d) {
+                    sink.push(d.to_string());
+                }
+            }
+        }
+        split
+    }
+}
+
 // Wire definitions from v2fly/v2ray-core app/router/routercommon/common.proto.
 // Unknown protobuf fields are ignored, permitting newer databases.
 #[derive(Clone, PartialEq, Message)]

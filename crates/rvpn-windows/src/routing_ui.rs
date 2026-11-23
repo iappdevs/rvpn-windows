@@ -283,7 +283,14 @@ impl RoutingDraft {
                 self.sites.len()
             ));
             if profile.mode == crate::profile::ConnMode::Tun {
-                ui.colored_label(Color32::YELLOW, "Select Proxy mode to use these rules");
+                ui.colored_label(
+                    Color32::GREEN,
+                    "Full tunnel follows these rules: Direct GeoIP/CIDR rules bypass the tunnel",
+                )
+                .on_hover_text(
+                    "Country and CIDR rules become OS bypass routes; domain rules apply to the \
+                     DNS layer and fully in proxy mode. Block rules apply in proxy mode and to ads.",
+                );
             }
         });
     }
