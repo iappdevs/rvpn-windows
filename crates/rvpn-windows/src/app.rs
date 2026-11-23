@@ -96,6 +96,8 @@ pub struct RvpnApp {
     show_window: bool,
     /// Self-update state (checked in the background at launch).
     update: UpdateState,
+    /// Auto-check found a newer release → show the popup once.
+    update_popup: bool,
     update_rx: Option<std::sync::mpsc::Receiver<UpdateMsg>>,
     update_relaunched: bool,
     /// After the launch check, further checks/failures are silent unless manual.
@@ -147,6 +149,7 @@ impl RvpnApp {
             force_quit: false,
             show_window: !start_minimized,
             update: UpdateState::Idle,
+            update_popup: false,
             update_rx: None,
             update_relaunched: false,
             auto_update_silent: false,
@@ -444,6 +447,9 @@ impl RvpnApp {
                         );
                         if newer {
                             tracing::info!(tag = %info.tag, "update available");
+                            if !self.auto_update_silent {
+                                self.update_popup = true;
+                            }
                             self.update = UpdateState::Available(Box::new(info));
                         } else {
                             self.update = UpdateState::Idle;
@@ -996,6 +1002,7 @@ impl eframe::App for RvpnApp {
 
         self.render_shell(ctx);
 
+        self.show_update_popup(ctx);
         self.show_tofu_dialog(ctx);
         self.show_profile_editor(ctx);
 
@@ -1801,6 +1808,60 @@ impl RvpnApp {
     }
 
     // ---- dialogs ---------------------------------------------------------------
+
+    /// First-launch update notification: a modal with the release notes.
+    /// Accepting runs the whole pipeline (download → swap → relaunch).
+    fn show_update_popup(&mut self, ctx: &egui::Context) {
+        if !self.update_popup {
+            return;
+        }
+        let info = match &self.update {
+            UpdateState::Available(info) => info.clone(),
+            _ => {
+                self.update_popup = false;
+                return;
+            }
+        };
+        egui::Window::new(format!("Update available — {}", info.tag))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.add_space(4.0);
+                ui.label("A new version of R-VPN is ready to install:");
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for line in info.body.lines().filter(|l| !l.trim().is_empty()) {
+                        let text = line.trim_start_matches('#').trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if line.starts_with("###") {
+                            ui.label(RichText::new(text).strong());
+                        } else {
+                            ui.label(RichText::new(text).small().color(Color32::from_gray(170)));
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Later").clicked() {
+                        self.update_popup = false;
+                        self.update = UpdateState::Idle;
+                        self.auto_update_silent = true;
+                    }
+                    let btn = egui::Button::new(
+                        RichText::new("Update now").strong().color(Color32::BLACK),
+                    )
+                    .fill(ACCENT);
+                    if ui.add(btn).clicked() {
+                        self.update_popup = false;
+                        self.start_update_install();
+                    }
+                });
+            });
+    }
 
     fn show_tofu_dialog(&mut self, ctx: &egui::Context) {
         let Some((slug, expected, actual)) = self.tofu_dialog.clone() else {
