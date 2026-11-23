@@ -567,9 +567,12 @@ impl EngineHandle {
         // and the engine's split lists, so e.g. `geoip:ir` stays off the
         // tunnel here too. Legacy profile fields are folded into the rules
         // by `RoutingConfig::from_profile`.
-        let split = crate::routing::RoutingConfig::from_profile(profile).tunnel_split();
+        let split = crate::routing::RoutingConfig::from_profile(profile)
+            .tunnel_split()
+            .context("cannot compile the routing rules for full tunnel")?;
         tracing::info!(
             countries = ?split.countries,
+            country_cidrs = split.country_cidrs.len(),
             networks = split.networks.len(),
             bypass_domains = split.bypass_domains.len(),
             tunnel_domains = split.tunnel_domains.len(),
@@ -685,14 +688,10 @@ impl EngineHandle {
             .configure_address(ip, winroute::TUNNEL_NETMASK)
             .context("failed to configure the tunnel interface")?;
 
+        // GeoIP rules arrive pre-expanded from the app's own database
+        // (the engine's compiled-in table lacks most countries, e.g. IR).
         let mut bypass_cidrs: Vec<String> = split.networks.clone();
-        for country in &split.countries {
-            if let Some(cidrs) = rvpn_mobile::rvpn_split_tunnel::get_country_ips(country) {
-                bypass_cidrs.extend(cidrs.iter().map(|s| s.to_string()));
-            } else {
-                tracing::warn!(country, "unknown bypass country code");
-            }
-        }
+        bypass_cidrs.extend(split.country_cidrs.iter().cloned());
         winroute::install_routes(
             winroute::ADAPTER_NAME,
             gateway,

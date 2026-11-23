@@ -156,6 +156,9 @@ fn legacy_domains(domains: &[String]) -> Vec<String> {
 pub struct TunnelSplit {
     /// GeoIP country codes whose traffic bypasses the tunnel (e.g. `IR`).
     pub countries: Vec<String>,
+    /// Those countries expanded to CIDRs from the app's GeoIP database —
+    /// the OS route table and the engine both get these directly.
+    pub country_cidrs: Vec<String>,
     /// CIDRs routed outside the tunnel.
     pub networks: Vec<String>,
     /// Domains routed outside the tunnel (engine suffix/`*.` form).
@@ -166,7 +169,12 @@ pub struct TunnelSplit {
 
 impl RoutingConfig {
     /// Compile the enabled rules into the engine's tunnel-mode fields.
-    pub fn tunnel_split(&self) -> TunnelSplit {
+    ///
+    /// `geoip:XX` codes are expanded through the app's own GeoIP database
+    /// (the same one proxy mode matches with — auto-updated, and it has
+    /// every country). The engine's compiled-in country table only knows a
+    /// handful of Asian codes, so it cannot be trusted for e.g. `geoip:ir`.
+    pub fn tunnel_split(&self) -> Result<TunnelSplit> {
         let mut split = TunnelSplit::default();
         for rule in self.rules.iter().filter(|r| r.enabled) {
             for pattern in &rule.ips {
@@ -176,8 +184,16 @@ impl RoutingConfig {
                     if code == "PRIVATE" {
                         continue; // builtin LAN bypass already covers it
                     }
-                    if !code.is_empty() && !split.countries.contains(&code) {
+                    if code.is_empty() {
+                        continue;
+                    }
+                    if !split.countries.contains(&code) {
+                        let cidrs = expand_country(&code)?;
+                        if cidrs.is_empty() {
+                            bail!("Unknown geoip:{code}");
+                        }
                         split.countries.push(code);
+                        split.country_cidrs.extend(cidrs);
                     }
                 } else if let Ok(net) = pattern.parse::<IpNetwork>() {
                     let net = net.to_string();
@@ -203,8 +219,22 @@ impl RoutingConfig {
                 }
             }
         }
-        split
+        Ok(split)
     }
+}
+
+/// Expand a country code to CIDRs via the active GeoIP database.
+fn expand_country(code: &str) -> Result<Vec<String>> {
+    let data = geodata()?;
+    let entry = data
+        .ips
+        .get(&code.to_ascii_lowercase())
+        .with_context(|| format!("Unknown geoip:{code}"))?;
+    entry
+        .cidr
+        .iter()
+        .map(|c| Ok(cidr_network(c)?.to_string()))
+        .collect()
 }
 
 // Wire definitions from v2fly/v2ray-core app/router/routercommon/common.proto.
