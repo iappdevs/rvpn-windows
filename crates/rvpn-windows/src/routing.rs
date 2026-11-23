@@ -219,8 +219,71 @@ impl RoutingConfig {
                 }
             }
         }
+        // Fold the bypass list first: every CIDR becomes a route, and the
+        // GeoIP database ships thousands of adjacent ranges for one country.
+        split.country_cidrs = merge_supernets(std::mem::take(&mut split.country_cidrs));
         Ok(split)
     }
+}
+
+/// Fold CIDRs into the smallest list with the same IPv4 coverage.
+///
+/// Overlapping and adjacent ranges are joined, nested ones disappear, and
+/// each joined range is cut back into CIDRs. Entries that are not IPv4 are
+/// dropped (tunnel routing is IPv4-only today); a `0.0.0.0/0` result is
+/// never emitted — that would be a second default route.
+fn merge_supernets(list: Vec<String>) -> Vec<String> {
+    let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(list.len());
+    for cidr in &list {
+        let Some((ip, len)) = split_cidr(cidr) else {
+            continue;
+        };
+        let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+        ranges.push((u32::from(ip) & mask, (u32::from(ip) & mask) | !mask));
+    }
+    ranges.sort_unstable();
+
+    let mut joined: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        let (start, end) = (u64::from(start), u64::from(end));
+        match joined.last_mut() {
+            // Overlapping or directly adjacent ranges become one.
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+
+    let mut out = Vec::with_capacity(joined.len());
+    for (mut start, end) in joined {
+        while start <= end {
+            // Largest block that is aligned at `start` and fits before `end`.
+            let mut prefix = 32u32;
+            while prefix > 0 {
+                let double = 1u64 << (32 - (prefix - 1));
+                if start % double == 0 && start + double - 1 <= end {
+                    prefix -= 1;
+                } else {
+                    break;
+                }
+            }
+            if prefix > 0 {
+                let addr = Ipv4Addr::from(u32::try_from(start).unwrap_or(u32::MAX));
+                out.push(format!("{addr}/{prefix}"));
+            }
+            start += 1u64 << (32 - prefix);
+        }
+    }
+    out
+}
+
+/// "a.b.c.d/len" -> (address, prefix length); IPv4 only.
+fn split_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    let (ip, len) = cidr.split_once('/')?;
+    let len = len.parse().ok()?;
+    if len > 32 {
+        return None;
+    }
+    ip.parse::<Ipv4Addr>().ok().map(|ip| (ip, len))
 }
 
 /// Expand a country code to CIDRs via the active GeoIP database.
@@ -739,3 +802,131 @@ fn cidr_network(cidr: &Cidr) -> Result<IpNetwork> {
     };
     Ok(IpNetwork::new(ip, u8::try_from(cidr.prefix)?)?)
 }
+#[cfg(test)]
+mod tunnel_split_tests {
+    use super::*;
+
+    fn covered(cidrs: &[String]) -> u128 {
+        // Sum of range lengths, computed independently of the merge.
+        let mut ranges: Vec<(u128, u128)> = cidrs
+            .iter()
+            .filter_map(|c| {
+                let net: IpNetwork = c.parse().ok()?;
+                let IpNetwork::V4(v4) = net else { return None };
+                let start = u32::from(v4.network_address()) as u128;
+                Some((start, start + 2u128.pow(32 - u32::from(v4.netmask())) - 1))
+            })
+            .collect();
+        ranges.sort_unstable();
+        let (mut total, mut cur) = (0u128, (0u128, 0u128));
+        for r in ranges {
+            if r.0 <= cur.1 + 1 {
+                cur.1 = cur.1.max(r.1);
+            } else {
+                total += cur.1 - cur.0 + 1;
+                cur = r;
+            }
+        }
+        total + cur.1 - cur.0 + 1
+    }
+
+    #[test]
+    fn adjacent_siblings_and_nested_ranges_fold() {
+        assert_eq!(
+            merge_supernets(vec!["5.0.0.0/9".into(), "5.128.0.0/9".into()]),
+            ["5.0.0.0/8"]
+        );
+        assert_eq!(
+            merge_supernets(vec![
+                "5.0.0.0/9".into(),
+                "5.0.0.0/10".into(),
+                "5.128.0.0/9".into()
+            ]),
+            ["5.0.0.0/8"]
+        );
+        assert_eq!(
+            merge_supernets(vec!["5.0.0.0/24".into(), "5.0.0.128/25".into()]),
+            ["5.0.0.0/24"]
+        );
+    }
+
+    #[test]
+    fn separate_ranges_stay_separate_and_v6_is_dropped() {
+        assert_eq!(
+            merge_supernets(vec!["5.0.0.0/24".into(), "5.0.2.0/24".into()]),
+            ["5.0.0.0/24", "5.0.2.0/24"]
+        );
+        assert_eq!(merge_supernets(vec!["2a00::/32".into()]), Vec::<String>::new());
+        assert_eq!(merge_supernets(vec!["garbage".into()]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn never_emits_a_default_route() {
+        assert_eq!(
+            merge_supernets(vec!["0.0.0.0/1".into(), "128.0.0.0/1".into()]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            merge_supernets(vec!["0.0.0.0/2".into(), "64.0.0.0/2".into()]),
+            ["0.0.0.0/1"]
+        );
+    }
+
+    /// The user's scenario: a `geoip:ir` Direct rule, compiled against the
+    /// GeoIP database that ships with the app.
+    #[test]
+    fn geoip_ir_compiles_to_a_covering_v4_list() {
+        let config = RoutingConfig {
+            rules: vec![Rule {
+                name: "Iran".into(),
+                enabled: true,
+                outbound: Outbound::Direct,
+                domains: vec![],
+                ips: vec!["geoip:ir".into(), "geoip:private".into()],
+            }],
+            ..Default::default()
+        };
+        let split = config.tunnel_split().unwrap();
+        assert_eq!(split.countries, ["IR"]);
+        assert!(!split.country_cidrs.is_empty());
+
+        let raw = expand_country("IR").unwrap();
+        println!("geoip:ir: {} CIDRs in the database -> {} routes", raw.len(), split.country_cidrs.len());
+        assert!(split.country_cidrs.len() <= raw.len(), "merge must not grow the list");
+        assert_eq!(
+            covered(&split.country_cidrs),
+            covered(&raw),
+            "merged routes must cover exactly the IR ranges"
+        );
+        assert!(split.country_cidrs.iter().all(|c| !c.contains(':')));
+        assert!(split.country_cidrs.len() > 100);
+    }
+
+    #[test]
+    fn disabled_and_foreign_rules_do_not_bypass() {
+        let config = RoutingConfig {
+            rules: vec![Rule {
+                name: "off".into(),
+                enabled: false,
+                outbound: Outbound::Direct,
+                domains: vec![],
+                ips: vec!["geoip:ir".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(config.tunnel_split().unwrap().country_cidrs.is_empty());
+
+        let unknown = RoutingConfig {
+            rules: vec![Rule {
+                name: "typo".into(),
+                enabled: true,
+                outbound: Outbound::Direct,
+                domains: vec![],
+                ips: vec!["geoip:zz".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(unknown.tunnel_split().is_err(), "an unknown code must fail the connect, not silently tunnel everything");
+    }
+}
+

@@ -4190,7 +4190,7 @@ dependencies = [
 
 [[package]]
 name = "rvpn-windows"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -108,6 +108,11 @@ impl Tray {
                     let _ = menu_tx.send(TrayCommand::ToggleConnection);
                 }
                 "quit" => {
+                    // Same reason as "show": the command is only processed by
+                    // the egui loop, which does not run while the window is
+                    // hidden — un-stall it first or Quit is never seen and the
+                    // app has to be killed from Task Manager.
+                    crate::platform::show_main_window();
                     let _ = menu_tx.send(TrayCommand::Quit);
                 }
                 _ => {}

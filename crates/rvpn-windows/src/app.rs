@@ -556,6 +556,18 @@ impl RvpnApp {
         self.force_quit = true;
         self.show_window = true;
         self.disconnect();
+        // Safety net: teardown releases the resolver and the bypass routes
+        // first, then drops the async runtime — which can stall on a blocking
+        // resolver against the just-torn-down tunnel. Leave it a generous
+        // window, then exit rather than keep a zombie process in the tray.
+        std::thread::Builder::new()
+            .name("rvpn-quit-watchdog".into())
+            .spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                tracing::warn!("quit watchdog fired — forcing exit");
+                std::process::exit(0);
+            })
+            .ok();
     }
 
     fn shutdown_complete(&self) -> bool {
@@ -2207,6 +2219,7 @@ mod tests {
             editor_tab: 0,
             update: Default::default(),
             update_rx: None,
+            update_popup: false,
             update_relaunched: false,
             auto_update_silent: true,
             settings_tab: 0,

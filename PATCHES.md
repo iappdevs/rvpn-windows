@@ -24,6 +24,13 @@ Highlights:
    test reconstructs a 65537-byte browser write across padded chunks. The
    protocol and server do not change. The patch includes this local change
    without requiring a commit in the upstream checkout.
+5. **Inline domain lists for split tunneling** (`0008`) — `TunConfig` has
+   always carried `bypass_domains` / `tunnel_domains`, but the direct-tun
+   DNS proxy never passed them to `SplitTunnelConfig`, so the fields were
+   dead for every caller of `rvpn_start` / `rvpn_tun_create`. The Windows
+   client feeds the routing rules' Direct/Proxy domains through them, so
+   domain rules also apply in full-tunnel mode. No behaviour change for
+   callers that leave the lists empty.
 
 ## Extra-root TLS deployments
 
@@ -89,7 +96,21 @@ a domain + Let's Encrypt remains the recommended production setup).
 
 - Optional `RVPN_TLS_ROOT_CA` extra roots via `rustls-pemfile` (see above).
 
+### 9. `rvpn/crates/rvpn-split-tunnel` + `rvpn-mobile` (`0008`)
+
+- `SplitTunnelConfig` gains `bypass_domains` and `tunnel_domains` inline
+  lists, normalised like the `_file` variants (lower-case, FQDN dots
+  stripped).
+- `IosTunClient::get_bypass_domains` / `get_tunnel_domains` expose the
+  config lists; `start_dns_proxy_for_direct_tun` passes them through.
+
 ## Why rustls instead of BoringSSL on Windows?
+
+> **Outdated:** since the `windows: switch TLS from rustls to boring` commit
+> the tunnel transport on Windows uses the boring backend — the engine logs
+> `TLS connected (Chrome fingerprint)` — matching the macOS client. The
+> rustls wiring below is kept for the features and extra-root option that
+> still build on it.
 
 The macOS client uses the boring backend to mimic Chrome's ClientHello
 shape. Building BoringSSL on Windows MSVC requires cmake + nasm in the

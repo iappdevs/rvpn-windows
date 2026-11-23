@@ -1,0 +1,138 @@
+From a6a23a157dd778d9f4f5dc1c9c3a75d2d77a16be Mon Sep 17 00:00:00 2001
+From: iappdevs <branchaya3@gmail.com>
+Date: Mon, 23 Nov 2026 19:51:02 +0330
+Subject: [PATCH] split-tunnel: accept inline bypass/tunnel domain lists
+
+TunConfig has carried bypass_domains/tunnel_domains all along, but the
+direct-tun DNS proxy built its SplitTunnelConfig without them, so the
+fields were dead on every platform that uses rvpn_start/rvpn_tun_create.
+SplitTunnelConfig gains the two inline lists (same normalization as the
+file lists), IosTunClient exposes its config lists, and the DNS proxy
+passes them through.
+
+No behaviour change for callers that leave the lists empty.
+---
+ rvpn/crates/rvpn-mobile/src/ios_tun.rs        | 10 +++++++
+ rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs    |  2 ++
+ rvpn/crates/rvpn-split-tunnel/src/config.rs   | 12 +++++++++
+ .../rvpn-split-tunnel/src/split_tunnel.rs     | 26 +++++++++++++++++--
+ 4 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/rvpn/crates/rvpn-mobile/src/ios_tun.rs b/rvpn/crates/rvpn-mobile/src/ios_tun.rs
+index 5232156..988895d 100644
+--- a/rvpn/crates/rvpn-mobile/src/ios_tun.rs
++++ b/rvpn/crates/rvpn-mobile/src/ios_tun.rs
+@@ -942,6 +942,16 @@ impl IosTunClient {
+         &self.config.builtin_bypass_countries
+     }
+ 
++    /// Direct-routing domain list from config (routing rules in TUN mode).
++    pub fn get_bypass_domains(&self) -> &[String] {
++        &self.config.bypass_domains
++    }
++
++    /// Force-tunnel domain list from config (routing rules in TUN mode).
++    pub fn get_tunnel_domains(&self) -> &[String] {
++        &self.config.tunnel_domains
++    }
++
+     /// Check if block ads is enabled in config
+     pub fn is_block_ads_enabled(&self) -> bool {
+         self.config.block_ads
+diff --git a/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs b/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs
+index 93d2e4c..76fa4fe 100644
+--- a/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs
++++ b/rvpn/crates/rvpn-mobile/src/ios_tun_ffi.rs
+@@ -794,6 +794,8 @@ pub async fn start_dns_proxy_for_direct_tun(client: &Arc<IosTunClient>) -> anyho
+         enabled: true,
+         builtin_bypass_countries: client.get_builtin_bypass_countries().to_vec(),
+         bypass_networks: Vec::new(),
++        bypass_domains: client.get_bypass_domains().to_vec(),
++        tunnel_domains: client.get_tunnel_domains().to_vec(),
+         block_ads: client.is_block_ads_enabled(),
+         ..Default::default()
+     };
+diff --git a/rvpn/crates/rvpn-split-tunnel/src/config.rs b/rvpn/crates/rvpn-split-tunnel/src/config.rs
+index 4dd0657..0bcb64e 100644
+--- a/rvpn/crates/rvpn-split-tunnel/src/config.rs
++++ b/rvpn/crates/rvpn-split-tunnel/src/config.rs
+@@ -54,6 +54,16 @@ pub struct SplitTunnelConfig {
+     #[serde(default, alias = "bypass_networks")]
+     pub bypass_networks: Vec<String>,
+ 
++    /// Inline bypass domains (suffix / `*.wildcard` form)
++    /// Loaded in addition to bypass_domains_file.
++    #[serde(default)]
++    pub bypass_domains: Vec<String>,
++
++    /// Inline tunnel domains (suffix / `*.wildcard` form)
++    /// Loaded in addition to tunnel_domains_file.
++    #[serde(default)]
++    pub tunnel_domains: Vec<String>,
++
+     /// Path to a JSON file mapping country codes to CIDR arrays.
+     /// Format: {"CN": ["1.0.1.0/24", ...], "HK": [...]}
+     /// Used instead of compiled-in builtin_ips when the builtin-ips feature is disabled.
+@@ -74,6 +84,8 @@ impl Default for SplitTunnelConfig {
+             block_ads: false,
+             ad_block_file: None,
+             bypass_networks: Vec::new(),
++            bypass_domains: Vec::new(),
++            tunnel_domains: Vec::new(),
+             country_ips_file: None,
+         }
+     }
+diff --git a/rvpn/crates/rvpn-split-tunnel/src/split_tunnel.rs b/rvpn/crates/rvpn-split-tunnel/src/split_tunnel.rs
+index 012f121..5338ff4 100644
+--- a/rvpn/crates/rvpn-split-tunnel/src/split_tunnel.rs
++++ b/rvpn/crates/rvpn-split-tunnel/src/split_tunnel.rs
+@@ -559,7 +559,13 @@ impl SplitTunnel {
+             }
+         }
+ 
+-        // Load bypass domains
++        // Load bypass domains (inline list first, then optional file)
++        if !config.bypass_domains.is_empty() {
++            let count = config.bypass_domains.len();
++            let domains = Self::parse_domain_list(&config.bypass_domains);
++            data.bypass_domains.extend(domains);
++            info!("Loaded {count} inline bypass domains");
++        }
+         if let Some(ref path) = config.bypass_domains_file {
+             match Self::load_domains(path).await {
+                 Ok(domains) => {
+@@ -589,7 +595,13 @@ impl SplitTunnel {
+             }
+         }
+ 
+-        // Load tunnel domains
++        // Load tunnel domains (inline list first, then optional file)
++        if !config.tunnel_domains.is_empty() {
++            let count = config.tunnel_domains.len();
++            let domains = Self::parse_domain_list(&config.tunnel_domains);
++            data.tunnel_domains.extend(domains);
++            info!("Loaded {count} inline tunnel domains");
++        }
+         if let Some(ref path) = config.tunnel_domains_file {
+             match Self::load_domains(path).await {
+                 Ok(domains) => {
+@@ -689,6 +701,16 @@ impl SplitTunnel {
+     }
+ 
+     /// Load domains from a file (one domain per line)
++    /// Normalize an inline domain list with the same rules `load_domains`
++    /// applies to files (lowercase, strip FQDN dots, skip blanks).
++    fn parse_domain_list(list: &[String]) -> HashSet<String> {
++        list.iter()
++            .map(|d| d.trim().to_lowercase())
++            .map(|d| d.trim_end_matches('.').to_string())
++            .filter(|d| !d.is_empty() && !d.starts_with('#'))
++            .collect()
++    }
++
+     async fn load_domains(path: &Path) -> Result<HashSet<String>> {
+         let content = tokio::fs::read_to_string(path).await?;
+         let mut domains = HashSet::new();
+-- 
+2.51.0.windows.1
+

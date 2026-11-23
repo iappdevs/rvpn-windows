@@ -212,22 +212,36 @@ fn run_ps_with_timeout(script: &str, timeout: Duration) -> Result<String> {
         .spawn()
         .context("failed to spawn powershell")?;
 
+    // Drain both pipes while the child runs. Left unread, a child that
+    // writes more than a pipe buffer blocks on the write and never exits —
+    // the poll below would then wait until the watchdog every time.
+    fn drain<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            buf
+        })
+    }
+    let stdout = drain(child.stdout.take().context("stdout not piped")?);
+    let stderr = drain(child.stderr.take().context("stderr not piped")?);
+
     let deadline = std::time::Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait()? {
-            Some(_) => break,
+            Some(status) => break status,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
                 bail!("powershell timed out after {}s", timeout.as_secs());
             }
-            None => std::thread::sleep(Duration::from_millis(200)),
+            None => std::thread::sleep(Duration::from_millis(100)),
         }
-    }
-
-    let out = child
-        .wait_with_output()
-        .context("failed to collect powershell output")?;
+    };
+    let out = std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    };
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         bail!("powershell failed: {}", if err.is_empty() { out.status.to_string() } else { err });
@@ -245,6 +259,25 @@ impl Drop for TempDirGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// More than any pipe buffer. Left unread, the child would block on the
+    /// write and the poll would sit until the watchdog — which is what the
+    /// first watchdog implementation did.
+    #[test]
+    fn large_powershell_output_does_not_deadlock() {
+        let started = std::time::Instant::now();
+        let out = run_ps_with_timeout(
+            "[Console]::Write(('x' * 200000))",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(out.matches('x').count(), 200_000);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "took {:?} — the output was not drained while the child ran",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn version_parsing_and_comparison() {

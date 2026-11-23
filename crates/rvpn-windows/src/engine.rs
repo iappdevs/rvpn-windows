@@ -19,7 +19,7 @@
 //! connect can never leak a runtime, a session, or a route. On success the
 //! same bundle is moved into `Teardown` and unwound by `teardown_inner`.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -126,12 +126,35 @@ pub struct EngineInner {
     connected_at: Mutex<Option<Instant>>,
     /// Everything acquired by a successful connect; unwound by teardown.
     teardown: Mutex<Option<Teardown>>,
+    /// Bypass routes this connect installed on the physical NIC. They outlive
+    /// the tunnel adapter, so teardown (and a failed connect) must remove them.
+    bypass: Mutex<Option<winroute::BypassBatch>>,
     /// Pump threads (also set on partial failure so teardown can join them).
     pumps: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Set once teardown has run (or a connect attempt definitively failed).
     torn_down: AtomicBool,
     stop_requested: AtomicBool,
     teardown_done: (Mutex<bool>, std::sync::Condvar),
+}
+
+/// Removes the bypass batch when a connect fails or is cancelled after
+/// installing it: teardown never sees the resources of a failed connect.
+struct BypassGuard<'a> {
+    inner: &'a EngineInner,
+    /// Cleared once teardown takes over, so a normal return keeps the routes.
+    armed: bool,
+}
+
+impl Drop for BypassGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(batch) = self.inner.bypass.lock().unwrap().take() {
+            winroute::remove_bypass_routes_batch(&batch);
+            winroute::clear_route_journal();
+        }
+    }
 }
 
 struct Teardown {
@@ -192,6 +215,7 @@ impl EngineHandle {
                 tx_bytes: Arc::new(AtomicU64::new(0)),
                 connected_at: Mutex::new(None),
                 teardown: Mutex::new(None),
+                bypass: Mutex::new(None),
                 pumps: Mutex::new(Vec::new()),
                 torn_down: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
@@ -560,6 +584,7 @@ impl EngineHandle {
 
         // Resources acquired along the way; Drop unwinds on failure.
         let mut flow = Teardown::default();
+        let mut bypass_guard: Option<BypassGuard<'_>> = None;
 
         // ---- 1. Engine config ---------------------------------------------------
         // The v2rayN-style routing rules apply in BOTH modes: in TUN mode the
@@ -688,17 +713,46 @@ impl EngineHandle {
             .configure_address(ip, winroute::TUNNEL_NETMASK)
             .context("failed to configure the tunnel interface")?;
 
-        // GeoIP rules arrive pre-expanded from the app's own database
-        // (the engine's compiled-in table lacks most countries, e.g. IR).
+        // GeoIP rules arrive pre-expanded from the app's own database (the
+        // engine's compiled-in table lacks most countries, e.g. IR) and
+        // supernet-merged. The batch installs in-process: one `netsh` per CIDR
+        // held the connect for minutes on a geoip:ir rule.
         let mut bypass_cidrs: Vec<String> = split.networks.clone();
         bypass_cidrs.extend(split.country_cidrs.iter().cloned());
         winroute::install_routes(
             winroute::ADAPTER_NAME,
             gateway,
             &original_route,
-            &bypass_cidrs,
+            &[], // bypass routes go in below, as one batch
         )
         .context("failed to install tunnel routes")?;
+        if original_route.is_usable() && !bypass_cidrs.is_empty() {
+            let next_hop: Ipv4Addr = original_route
+                .next_hop
+                .parse()
+                .context("the default route has no usable gateway")?;
+            let t0 = std::time::Instant::now();
+            let batch = winroute::add_bypass_routes_batch(
+                &original_route.interface_alias,
+                next_hop,
+                &bypass_cidrs,
+            )
+            .context("failed to install the bypass routes")?;
+            tracing::info!(
+                routes = batch.cidrs.len(),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "bypass routes installed"
+            );
+            if !batch.cidrs.is_empty() {
+                winroute::write_route_journal(&batch);
+                *self.inner.bypass.lock().unwrap() = Some(batch);
+                // A failed step below must not leave them on the NIC.
+                bypass_guard = Some(BypassGuard {
+                    inner: &self.inner,
+                    armed: true,
+                });
+            }
+        }
 
         // DNS strategy: the loopback DoH proxy needs UDP 127.0.0.1:53. Local
         // DNS tools (e.g. Shecan/nextdns) often hold that port — routing the
@@ -765,12 +819,86 @@ impl EngineHandle {
             !self.inner.stop_flag.load(Ordering::SeqCst),
             "Connection cancelled"
         );
+
+        // ---- 11. Wait until the tunnel really carries ----------------------------
+        // Windows keeps a freshly configured IPv4 address Tentative for ~3 s
+        // (duplicate-address detection). Until then the kernel answers
+        // "unreachable" for everything routed through the adapter — so
+        // announcing Connected any earlier hands the user a tunnel that
+        // fails on the first page load.
+        self.set_phase(EnginePhase::Connecting {
+            detail: "waiting for the tunnel interface".into(),
+        });
+        let routed_around = |ip: Ipv4Addr| {
+            bypass_cidrs
+                .iter()
+                .filter_map(|c| c.parse::<ip_network::IpNetwork>().ok())
+                .any(|net| net.contains(IpAddr::V4(ip)))
+        };
+        let probe = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(9, 9, 9, 9)]
+            .into_iter()
+            .find(|probe| !routed_around(*probe));
+        match probe {
+            Some(probe) => match Self::wait_until_routable(
+                probe,
+                ip,
+                &self.inner.stop_flag,
+                Duration::from_secs(8),
+            ) {
+                Ok(Some(settled)) => {
+                    *self.inner.connected_at.lock().unwrap() = Some(Instant::now());
+                    tracing::info!(
+                        settled_ms = settled.as_millis() as u64,
+                        "tunnel interface carries traffic"
+                    );
+                }
+                Ok(None) => tracing::warn!(
+                    "the tunnel interface did not become usable within 8 s — connecting anyway"
+                ),
+                Err(e) => return Err(e),
+            },
+            None => tracing::warn!("every probe address is routed around the tunnel — skipping the interface check"),
+        }
+
+        // Teardown owns the batch from here on; this guard must not remove
+        // on return what was just installed.
+        if let Some(guard) = bypass_guard.as_mut() {
+            guard.armed = false;
+        }
         self.set_phase(EnginePhase::Connected {
             ip: ip.to_string(),
             gateway: gateway.to_string(),
             server: profile.server_address.clone(),
         });
         Ok(())
+    }
+
+    /// Blocks until the kernel routes `probe` from `tunnel_ip` — the decision
+    /// a socket connect makes, without sending anything. `Ok(None)` means
+    /// `limit` passed without that happening; `Err` means a stop was asked.
+    fn wait_until_routable(
+        probe: Ipv4Addr,
+        tunnel_ip: Ipv4Addr,
+        stop: &AtomicBool,
+        limit: Duration,
+    ) -> Result<Option<Duration>> {
+        let started = Instant::now();
+        loop {
+            let from_tunnel = (|| -> Option<bool> {
+                let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+                socket.connect((probe, 53)).ok()?;
+                Some(socket.local_addr().ok()?.ip() == IpAddr::V4(tunnel_ip))
+            })()
+            .unwrap_or(false);
+            if from_tunnel {
+                return Ok(Some(started.elapsed()));
+            }
+            anyhow::ensure!(!stop.load(Ordering::SeqCst), "Connection cancelled");
+            if started.elapsed() >= limit {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn spawn_pumps(&self, client: &Arc<IosTunClient>, device: &Arc<TunDevice>) {
@@ -902,6 +1030,13 @@ fn teardown_inner(inner: &EngineInner) {
     }
     let _complete = Complete(inner);
 
+    // Bypass routes sit on the physical NIC, so they outlive both the tunnel
+    // adapter and this process — remove them before anything that can stall.
+    if let Some(batch) = inner.bypass.lock().unwrap().take() {
+        winroute::remove_bypass_routes_batch(&batch);
+        winroute::clear_route_journal();
+    }
+
     let teardown = inner.teardown.lock().unwrap().take();
     let Some(mut t) = teardown else {
         // Early-failure path: only pumps may exist (plus whatever run_connect
@@ -935,6 +1070,11 @@ fn teardown_inner(inner: &EngineInner) {
     }
     join_pumps(inner);
 
+    // Release the resolver before stopping the engine: this sweep is the one
+    // step a forced exit must not skip — a leftover "." rule keeps the system
+    // pointed at a loopback resolver that is about to disappear.
+    winroute::revert(&t.routes);
+
     // Stop the engine (WebSocket + reconnect loops) and the background tasks.
     if let Some(client) = t.client.as_ref() {
         client.set_reconnect_enabled(false);
@@ -950,7 +1090,6 @@ fn teardown_inner(inner: &EngineInner) {
     // Drop the device handle — when the last reference goes, the Wintun
     // adapter closes and interface-scoped routes/DNS die with it.
     t.device = None;
-    winroute::revert(&t.routes);
 
     // The runtime must be dropped last, off any tokio worker thread
     // (Runtime::drop shuts the blocking pool down synchronously).
@@ -1095,6 +1234,7 @@ mod tests {
                 tx_bytes: Arc::new(AtomicU64::new(0)),
                 connected_at: Mutex::new(None),
                 teardown: Mutex::new(None),
+                bypass: Mutex::new(None),
                 pumps: Mutex::new(vec![]),
                 torn_down: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
